@@ -48,8 +48,12 @@ def create_app() -> Flask:
     @app.post("/clients/new")
     def client_create():
         d = db()
+        full_name = request.form.get("full_name", "").strip()
+        if not full_name:
+            flash("Укажите ФИО клиента")
+            return redirect(url_for("client_new"))
         cid = d.add_client(
-            full_name=request.form["full_name"],
+            full_name=full_name,
             phone=request.form.get("phone", ""),
             telegram_id=request.form.get("telegram_id", ""),
             vk_id=request.form.get("vk_id", ""),
@@ -73,9 +77,13 @@ def create_app() -> Flask:
     @app.post("/clients/<int:cid>/edit")
     def client_update(cid: int):
         d = db()
+        full_name = request.form.get("full_name", "").strip()
+        if not full_name:
+            flash("Укажите ФИО клиента")
+            return redirect(url_for("client_edit", cid=cid))
         d.update_client(
             cid,
-            full_name=request.form["full_name"],
+            full_name=full_name,
             phone=request.form.get("phone", ""),
             telegram_id=request.form.get("telegram_id", ""),
             vk_id=request.form.get("vk_id", ""),
@@ -89,7 +97,11 @@ def create_app() -> Flask:
 
     @app.post("/clients/<int:cid>/delete")
     def client_delete(cid: int):
-        db().delete_client(cid)
+        d = db()
+        if d.has_orders_for_client(cid):
+            flash("Нельзя удалить клиента: у него есть заказы")
+            return redirect(url_for("clients"))
+        d.delete_client(cid)
         flash("Клиент удалён")
         return redirect(url_for("clients"))
 
@@ -102,8 +114,15 @@ def create_app() -> Flask:
     @app.post("/services/new")
     def service_create():
         d = db()
+        name = request.form.get("name", "").strip()
+        if not name:
+            flash("Укажите название услуги")
+            return redirect(url_for("services"))
+        if d.get_service_by_name(name) is not None:
+            flash("Услуга с таким названием уже существует")
+            return redirect(url_for("services"))
         d.add_service(
-            name=request.form["name"],
+            name=name,
             unit=request.form.get("unit", ""),
             price=_price(request.form.get("price")),
         )
@@ -112,7 +131,11 @@ def create_app() -> Flask:
 
     @app.post("/services/<int:sid>/delete")
     def service_delete(sid: int):
-        db().delete_service(sid)
+        d = db()
+        if d.has_orders_for_service(sid):
+            flash("Нельзя удалить услугу: она используется в заказах")
+            return redirect(url_for("services"))
+        d.delete_service(sid)
         flash("Услуга удалена")
         return redirect(url_for("services"))
 
@@ -146,14 +169,22 @@ def create_app() -> Flask:
     @app.post("/orders/new")
     def order_create():
         d = db()
+        client_id = _int(request.form.get("client_id"))
+        service_id = _int(request.form.get("service_id"))
+        if client_id is None or d.get_client(client_id) is None:
+            flash("Выберите существующего клиента")
+            return redirect(url_for("order_new"))
+        if service_id is None or d.get_service(service_id) is None:
+            flash("Выберите существующую услугу")
+            return redirect(url_for("order_new"))
         d.add_order(
-            client_id=int(request.form["client_id"]),
-            service_id=int(request.form["service_id"]),
+            client_id=client_id,
+            service_id=service_id,
             description=request.form.get("description", ""),
             model_file=request.form.get("model_file", ""),
             price=_price(request.form.get("price")),
             deadline=request.form.get("deadline", ""),
-            status_id=int(request.form.get("status_id", 1)),
+            status_id=_int(request.form.get("status_id", 1)) or 1,
         )
         flash("Заказ создан")
         return redirect(url_for("orders"))
@@ -177,11 +208,14 @@ def create_app() -> Flask:
         order = d.get_order(oid)
         if order is None:
             abort(404)
-        status_id = int(request.form["status_id"])
+        status = d.get_status(_int(request.form.get("status_id")) or 0)
+        if status is None:
+            flash("Указанный статус не существует")
+            return redirect(url_for("order_detail", oid=oid))
+        status_id = status["id"]
         if status_id == order["status_id"]:
             flash("Статус не изменился")
             return redirect(url_for("order_detail", oid=oid))
-        status = d.get_status(status_id)
         d.set_order_status(oid, status_id)
         client = d.get_client(order["client_id"])
         channel_map = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_id"}

@@ -45,6 +45,13 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM clients WHERE id = ?", (client_id,))
 
+    def has_orders_for_client(self, client_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM orders WHERE client_id = ?", (client_id,)
+            ).fetchone()
+            return row["n"] > 0
+
     # ---------- Каналы уведомлений клиента ----------
 
     def set_channel(self, client_id: int, channel: str, enabled: bool = True) -> None:
@@ -96,6 +103,13 @@ class Database:
     def delete_service(self, service_id: int) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM services WHERE id = ?", (service_id,))
+
+    def has_orders_for_service(self, service_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM orders WHERE service_id = ?", (service_id,)
+            ).fetchone()
+            return row["n"] > 0
 
     # ---------- Статусы ----------
 
