@@ -30,3 +30,25 @@ pip install -r requirements.txt
 python app.py
 ```
 Открыть http://127.0.0.1:5000
+
+## Уведомления
+Каналы настраиваются в `.env` (см. `.env.example`):
+- **Telegram** — `TG_TOKEN` (токен бота от @BotFather)
+- **VK** — `VK_TOKEN` + `VK_GROUP_ID` (токен сообщества VK Bot API, метод `messages.send`)
+- **MAX** — `MAX_ENDPOINT` + `MAX_TOKEN` (по официальному API)
+
+У клиента включите нужные каналы и укажите идентификаторы (telegram_id / vk_id / max_id).
+При смене статуса заказа клиент получает уведомление во все включённые каналы.
+Отказ одного канала не влияет на остальные.
+
+## Деплой на Orange Pi
+1. Скопируйте проект в `/opt/orders_app` на одноплатнике.
+2. Заполните `/opt/orders_app/.env` ключами.
+3. Запустите `sudo bash deploy/install.sh`.
+4. Сервис `orders` будет автоматически запускаться при загрузке.
+5. Проверка: `systemctl status orders`, откройте `http://<IP>:5000`.
+
+## Тесты
+```bash
+pytest
+```
