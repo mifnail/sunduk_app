@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Заказы{% endblock %}
+{% block content %}
+<h2>Заказы</h2>
+
+<form method="get" action="{{ url_for('orders') }}" class="card form row">
+  <select name="status">
+    <option value="">Все статусы</option>
+    {% for s in statuses %}
+    <option value="{{ s.id }}" {% if status_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+    {% endfor %}
+  </select>
+  <select name="client">
+    <option value="">Все клиенты</option>
+    {% for c in clients %}
+    <option value="{{ c.id }}" {% if client_id == c.id %}selected{% endif %}>{{ c.full_name }}</option>
+    {% endfor %}
+  </select>
+  <button>Фильтр</button>
+  <a class="btn" href="{{ url_for('order_new') }}">Новый заказ</a>
+</form>
+
+<table>
+  <thead>
+    <tr>
+      <th>№</th>
+      <th>Клиент</th>
+      <th>Услуга</th>
+      <th>Описание</th>
+      <th>Цена</th>
+      <th>Срок</th>
+      <th>Статус</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for o in orders %}
+    <tr>
+      <td><a href="{{ url_for('order_detail', oid=o.id) }}">#{{ o.id }}</a></td>
+      <td>{{ o.client_name }}</td>
+      <td>{{ o.service_name }}</td>
+      <td>{{ o.description or '' }}</td>
+      <td>{{ o.price or '' }}</td>
+      <td>{{ o.deadline or '' }}</td>
+      <td><span class="badge">{{ o.status_name }}</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

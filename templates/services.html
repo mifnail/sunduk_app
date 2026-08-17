@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Услуги{% endblock %}
+{% block content %}
+<h2>Услуги</h2>
+<form method="post" action="{{ url_for('service_create') }}" class="card form">
+  <div class="row">
+    <input type="text" name="name" placeholder="Название" required>
+    <input type="text" name="unit" placeholder="Ед. изм. (шт, г)">
+    <input type="number" step="0.01" name="price" placeholder="Цена">
+    <button>Добавить</button>
+  </div>
+</form>
+<table>
+  <thead><tr><th>Название</th><th>Ед. изм.</th><th>Цена</th><th></th></tr></thead>
+  <tbody>
+    {% for s in services %}
+    <tr>
+      <td>{{ s.name }}</td>
+      <td>{{ s.unit or '' }}</td>
+      <td>{{ s.price or '' }}</td>
+      <td>
+        <form method="post" action="{{ url_for('service_delete', sid=s.id) }}" class="inline">
+          <button class="danger small" onclick="return confirm('Удалить?')">Удалить</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,18 +1,205 @@
-from flask import Flask, render_template
+import os
+
+from flask import Flask, render_template, request, redirect, url_for, abort, flash
+
+from db_schema import init_db, seed_defaults
+from database import Database
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    instance = os.path.join(app.root_path, "instance")
+    os.makedirs(instance, exist_ok=True)
+    db_path = os.environ.get("ORDERS_DB", os.path.join(instance, "orders.db"))
     app.config.from_mapping(
-        DATABASE="instance/orders.db",
-        SECRET_KEY="dev",
+        DATABASE=db_path,
+        SECRET_KEY=os.environ.get("SECRET_KEY", "dev"),
     )
+
+    init_db(db_path)
+    seed_defaults(db_path)
+
+    def db() -> Database:
+        return Database(db_path)
+
+    # ---------- Главная ----------
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        d = db()
+        return render_template(
+            "index.html",
+            orders=d.list_orders(),
+            statuses=d.list_statuses(),
+        )
+
+    # ---------- Клиенты ----------
+
+    @app.get("/clients")
+    def clients():
+        return render_template("clients.html", clients=db().list_clients())
+
+    @app.get("/clients/new")
+    def client_new():
+        return render_template("client_form.html", client=None)
+
+    @app.post("/clients/new")
+    def client_create():
+        d = db()
+        cid = d.add_client(
+            full_name=request.form["full_name"],
+            phone=request.form.get("phone", ""),
+            telegram_id=request.form.get("telegram_id", ""),
+            vk_id=request.form.get("vk_id", ""),
+            max_id=request.form.get("max_id", ""),
+            notes=request.form.get("notes", ""),
+        )
+        for ch in ("telegram", "vk", "max"):
+            d.set_channel(cid, ch, bool(request.form.get(f"ch_{ch}")))
+        flash("Клиент добавлен")
+        return redirect(url_for("clients"))
+
+    @app.get("/clients/<int:cid>/edit")
+    def client_edit(cid: int):
+        d = db()
+        client = d.get_client(cid)
+        if client is None:
+            abort(404)
+        channels = {c["channel"]: c["enabled"] for c in d.list_channels(cid)}
+        return render_template("client_form.html", client=client, channels=channels)
+
+    @app.post("/clients/<int:cid>/edit")
+    def client_update(cid: int):
+        d = db()
+        d.update_client(
+            cid,
+            full_name=request.form["full_name"],
+            phone=request.form.get("phone", ""),
+            telegram_id=request.form.get("telegram_id", ""),
+            vk_id=request.form.get("vk_id", ""),
+            max_id=request.form.get("max_id", ""),
+            notes=request.form.get("notes", ""),
+        )
+        for ch in ("telegram", "vk", "max"):
+            d.set_channel(cid, ch, bool(request.form.get(f"ch_{ch}")))
+        flash("Клиент обновлён")
+        return redirect(url_for("clients"))
+
+    @app.post("/clients/<int:cid>/delete")
+    def client_delete(cid: int):
+        db().delete_client(cid)
+        flash("Клиент удалён")
+        return redirect(url_for("clients"))
+
+    # ---------- Услуги ----------
+
+    @app.get("/services")
+    def services():
+        return render_template("services.html", services=db().list_services())
+
+    @app.post("/services/new")
+    def service_create():
+        d = db()
+        d.add_service(
+            name=request.form["name"],
+            unit=request.form.get("unit", ""),
+            price=_price(request.form.get("price")),
+        )
+        flash("Услуга добавлена")
+        return redirect(url_for("services"))
+
+    @app.post("/services/<int:sid>/delete")
+    def service_delete(sid: int):
+        db().delete_service(sid)
+        flash("Услуга удалена")
+        return redirect(url_for("services"))
+
+    # ---------- Заказы ----------
+
+    @app.get("/orders")
+    def orders():
+        d = db()
+        status_id = _int(request.args.get("status"))
+        client_id = _int(request.args.get("client"))
+        return render_template(
+            "orders.html",
+            orders=d.list_orders(status_id=status_id, client_id=client_id),
+            statuses=d.list_statuses(),
+            clients=d.list_clients(),
+            status_id=status_id,
+            client_id=client_id,
+        )
+
+    @app.get("/orders/new")
+    def order_new():
+        d = db()
+        return render_template(
+            "order_detail.html",
+            order=None,
+            clients=d.list_clients(),
+            services=d.list_services(),
+            statuses=d.list_statuses(),
+        )
+
+    @app.post("/orders/new")
+    def order_create():
+        d = db()
+        d.add_order(
+            client_id=int(request.form["client_id"]),
+            service_id=int(request.form["service_id"]),
+            description=request.form.get("description", ""),
+            model_file=request.form.get("model_file", ""),
+            price=_price(request.form.get("price")),
+            deadline=request.form.get("deadline", ""),
+            status_id=int(request.form.get("status_id", 1)),
+        )
+        flash("Заказ создан")
+        return redirect(url_for("orders"))
+
+    @app.get("/orders/<int:oid>")
+    def order_detail(oid: int):
+        d = db()
+        order = d.get_order(oid)
+        if order is None:
+            abort(404)
+        return render_template(
+            "order_detail.html",
+            order=order,
+            history=d.order_history(oid),
+            statuses=d.list_statuses(),
+        )
+
+    @app.post("/orders/<int:oid>/status")
+    def order_set_status(oid: int):
+        d = db()
+        if d.get_order(oid) is None:
+            abort(404)
+        status_id = int(request.form["status_id"])
+        d.set_order_status(oid, status_id)
+        flash("Статус изменён")
+        return redirect(url_for("order_detail", oid=oid))
+
+    @app.post("/orders/<int:oid>/delete")
+    def order_delete(oid: int):
+        db().delete_order(oid)
+        flash("Заказ удалён")
+        return redirect(url_for("orders"))
 
     return app
+
+
+def _int(value: object) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _price(value: object) -> float | None:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 app = create_app()

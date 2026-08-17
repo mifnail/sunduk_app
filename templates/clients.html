@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Клиенты{% endblock %}
+{% block content %}
+<h2>Клиенты</h2>
+<a class="btn" href="{{ url_for('client_new') }}">Новый клиент</a>
+<table>
+  <thead>
+    <tr>
+      <th>ФИО</th>
+      <th>Телефон</th>
+      <th>Telegram</th>
+      <th>VK</th>
+      <th>MAX</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in clients %}
+    <tr>
+      <td>{{ c.full_name }}</td>
+      <td>{{ c.phone or '' }}</td>
+      <td>{{ c.telegram_id or '' }}</td>
+      <td>{{ c.vk_id or '' }}</td>
+      <td>{{ c.max_id or '' }}</td>
+      <td>
+        <a class="btn small" href="{{ url_for('client_edit', cid=c.id) }}">Изменить</a>
+        <form method="post" action="{{ url_for('client_delete', cid=c.id) }}" class="inline">
+          <button class="danger small" onclick="return confirm('Удалить клиента?')">Удалить</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

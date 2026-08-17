@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Клиент{% endblock %}
+{% block content %}
+<h2>{{ 'Редактирование клиента' if client else 'Новый клиент' }}</h2>
+<form method="post" action="{{ url_for('client_update', cid=client.id) if client else url_for('client_create') }}" class="card form">
+  <label>ФИО *</label>
+  <input type="text" name="full_name" required value="{{ client.full_name if client else '' }}">
+
+  <label>Телефон</label>
+  <input type="text" name="phone" value="{{ client.phone or '' }}">
+
+  <label>Telegram ID</label>
+  <input type="text" name="telegram_id" value="{{ client.telegram_id or '' }}">
+
+  <label>VK ID</label>
+  <input type="text" name="vk_id" value="{{ client.vk_id or '' }}">
+
+  <label>MAX ID</label>
+  <input type="text" name="max_id" value="{{ client.max_id or '' }}">
+
+  <label>Заметки</label>
+  <textarea name="notes">{{ client.notes or '' }}</textarea>
+
+  <fieldset>
+    <legend>Уведомления включены:</legend>
+    {% set ch = channels or {} %}
+    <label class="check"><input type="checkbox" name="ch_telegram" {% if ch.get('telegram') %}checked{% endif %}> Telegram</label>
+    <label class="check"><input type="checkbox" name="ch_vk" {% if ch.get('vk') %}checked{% endif %}> VK</label>
+    <label class="check"><input type="checkbox" name="ch_max" {% if ch.get('max') %}checked{% endif %}> MAX</label>
+  </fieldset>
+
+  <button>Сохранить</button>
+</form>
+{% endblock %}
