@@ -1,9 +1,11 @@
 import os
 
+from dotenv import load_dotenv
 from flask import Flask, render_template, request, redirect, url_for, abort, flash
 
 from db_schema import init_db, seed_defaults
 from database import Database
+from notifier import build_notifiers, order_status_message, send_notifications
 
 
 def create_app() -> Flask:
@@ -172,11 +174,27 @@ def create_app() -> Flask:
     @app.post("/orders/<int:oid>/status")
     def order_set_status(oid: int):
         d = db()
-        if d.get_order(oid) is None:
+        order = d.get_order(oid)
+        if order is None:
             abort(404)
         status_id = int(request.form["status_id"])
+        if status_id == order["status_id"]:
+            flash("Статус не изменился")
+            return redirect(url_for("order_detail", oid=oid))
+        status = d.get_status(status_id)
         d.set_order_status(oid, status_id)
-        flash("Статус изменён")
+        client = d.get_client(order["client_id"])
+        channel_map = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_id"}
+        enabled = {c["channel"] for c in d.list_channels(order["client_id"]) if c["enabled"]}
+        channels = {
+            ch: client[channel_map[ch]]
+            for ch in enabled
+            if client[channel_map[ch]]
+        }
+        notifiers = build_notifiers()
+        results = send_notifications(channels, order_status_message(order, status["name"]), notifiers)
+        sent = [k for k, v in results.items() if v]
+        flash("Статус изменён" + (f", уведомлено: {', '.join(sent)}" if sent else ""))
         return redirect(url_for("order_detail", oid=oid))
 
     @app.post("/orders/<int:oid>/delete")
