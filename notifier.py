@@ -66,26 +66,27 @@ class VKNotifier:
 class MaxNotifier:
     """Уведомления через мессенджер MAX.
 
-    Детали официального API MAX уточняются; интеграция построена через общий
-    интерфейс Notifier, поэтому при появлении точного API достаточно заменить
-    тело метода send() без изменения остального кода.
+    Использует официальный API MAX: POST /messages с заголовком
+    Authorization: <token>. Токен присваивается при создании бота.
     """
 
     name = "max"
 
-    def __init__(self, endpoint: str = "", token: str = ""):
-        self.endpoint = endpoint or os.environ.get("MAX_ENDPOINT", "")
+    def __init__(self, token: str = "", base_url: str = "https://platform-api2.max.ru"):
         self.token = token or os.environ.get("MAX_TOKEN", "")
+        self.base_url = base_url
 
     def send(self, recipient_id: str, message: str) -> bool:
-        if not self.endpoint or not self.token or not recipient_id:
+        if not self.token or not recipient_id:
             log.info("MAX: не настроен, пропускаем")
             return False
-        resp = requests.post(self.endpoint, json={
-            "token": self.token,
-            "user_id": recipient_id,
-            "text": message,
-        }, timeout=10)
+        resp = requests.post(
+            f"{self.base_url}/messages",
+            params={"user_id": recipient_id},
+            headers={"Authorization": self.token},
+            json={"text": message},
+            timeout=10,
+        )
         resp.raise_for_status()
         return True
 

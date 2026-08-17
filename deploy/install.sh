@@ -28,13 +28,16 @@ fi
 echo "=== 5. Права ==="
 sudo chown -R pi:pi "$APP_DIR"
 
-echo "=== 6. systemd-сервис ==="
+echo "=== 6. systemd-сервисы ==="
 sudo cp "$APP_DIR/deploy/orders.service" /etc/systemd/system/orders.service
+sudo cp "$APP_DIR/deploy/orders-max-bot.service" /etc/systemd/system/orders-max-bot.service
 sudo systemctl daemon-reload
 sudo systemctl enable orders
+sudo systemctl enable orders-max-bot
 sudo systemctl restart orders
+sudo systemctl restart orders-max-bot
 
 echo "=== 7. Проверка ==="
 sleep 2
-sudo systemctl status orders --no-pager
-echo "Сервис запущен. Откройте http://<IP-Orange-Pi>:5000"
+sudo systemctl status orders orders-max-bot --no-pager
+echo "Сервисы запущены. Откройте http://<IP-Orange-Pi>:5000"

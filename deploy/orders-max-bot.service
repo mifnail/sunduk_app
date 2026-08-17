@@ -1,0 +1,15 @@
+[Unit]
+Description=Orders — бот MAX (Long Polling)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/orders_app
+EnvironmentFile=/opt/orders_app/.env
+ExecStart=/opt/orders_app/venv/bin/python /opt/orders_app/max_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
