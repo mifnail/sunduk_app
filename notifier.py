@@ -20,12 +20,20 @@ class TelegramNotifier:
     def __init__(self, token: str = "", base_url: str = "https://api.telegram.org"):
         self.token = token or os.environ.get("TG_TOKEN", "")
         self.base_url = base_url
+        self.proxy = os.environ.get("TG_PROXY", "")
+
+    def _session(self) -> requests.Session:
+        s = requests.Session()
+        if self.proxy:
+            s.proxies = {"http": self.proxy, "https": self.proxy}
+        return s
 
     def send(self, recipient_id: str, message: str) -> bool:
         if not self.token or not recipient_id:
             return False
         url = f"{self.base_url}/bot{self.token}/sendMessage"
-        resp = requests.post(url, json={
+        session = self._session()
+        resp = session.post(url, json={
             "chat_id": recipient_id,
             "text": message,
             "disable_web_page_preview": True,
