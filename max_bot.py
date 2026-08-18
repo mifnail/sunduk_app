@@ -55,6 +55,7 @@ class MaxBot:
         body: dict = {"text": text}
         if buttons:
             body["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+        log.info("send_message → user_id=%s, text=%.80s", user_id, text)
         resp = self.session.post(
             f"{self.base_url}/messages",
             params={"user_id": user_id},
@@ -62,6 +63,7 @@ class MaxBot:
             json=body,
             timeout=15,
         )
+        log.info("send_message ← %s %s", resp.status_code, resp.text[:200])
         resp.raise_for_status()
         return True
 
@@ -93,12 +95,17 @@ class MaxBot:
         data = resp.json()
         if data.get("marker") is not None:
             self.marker = data["marker"]
-        return data.get("updates") or []
+        updates = data.get("updates") or []
+        if updates:
+            log.info("get_updates: %d updates, marker=%s", len(updates), self.marker)
+        return updates
 
     # ---------- Обработка событий ----------
 
     def handle_update(self, update: dict) -> None:
         up_type = update.get("update_type")
+        sender = self._sender_id(update)
+        log.info("handle_update: type=%s sender=%s", up_type, sender)
         if up_type == "message_created":
             self._on_message(update)
         elif up_type == "message_callback":
@@ -112,12 +119,12 @@ class MaxBot:
             return str(user["id"])
         message = update.get("message") or {}
         sender = message.get("sender") or {}
-        if sender.get("id") is not None:
-            return str(sender["id"])
+        if sender.get("user_id") is not None:
+            return str(sender["user_id"])
         callback = update.get("callback") or {}
         cb_user = callback.get("user") or {}
-        if cb_user.get("id") is not None:
-            return str(cb_user["id"])
+        if cb_user.get("user_id") is not None:
+            return str(cb_user["user_id"])
         if update.get("chat_id") is not None:
             return str(update["chat_id"])
         return None
@@ -300,7 +307,7 @@ class MaxBot:
                     try:
                         self.handle_update(update)
                     except Exception as exc:  # noqa: BLE001 - изоляция событий
-                        log.warning("Ошибка обработки события: %s", exc)
+                        log.warning("Ошибка обработки события: %s", exc, exc_info=True)
             except Exception as exc:  # noqa: BLE001 - пережидаем сбой API
                 log.warning("Ошибка Long Polling: %s", exc)
                 time.sleep(5)
