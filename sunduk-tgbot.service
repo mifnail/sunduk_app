@@ -1,0 +1,17 @@
+[Unit]
+Description=Sunduk Telegram Bot
+After=network.target xray.service
+
+[Service]
+User=dietpi
+Group=dietpi
+WorkingDirectory=/opt/sunduk_app
+EnvironmentFile=/opt/sunduk_app/.env
+ExecStart=/opt/sunduk_app/venv/bin/python /opt/sunduk_app/tg_bot.py
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
