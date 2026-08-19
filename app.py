@@ -5,7 +5,7 @@ from flask import Flask, render_template, request, redirect, url_for, abort, fla
 
 from db_schema import init_db, seed_defaults, migrate_db
 from database import Database
-from notifier import build_notifiers, order_status_message, send_notifications
+from services.order_service import OrderService, NotificationPayload
 
 
 def create_app() -> Flask:
@@ -22,8 +22,11 @@ def create_app() -> Flask:
     seed_defaults(db_path)
     migrate_db(db_path)
 
+    database = Database(db_path)
+    order_service = OrderService(database)
+
     def db() -> Database:
-        return Database(db_path)
+        return database
 
     # ---------- Главная ----------
 
@@ -220,7 +223,17 @@ def create_app() -> Flask:
             flash("Выберите существующую услугу")
             return redirect(url_for("order_new"))
 
-        order_id = d.add_order(
+        # Handle photo upload
+        photo_file = request.files.get("photo")
+        photo_data = None
+        photo_caption = ""
+        photo_mime = "image/jpeg"
+        if photo_file and photo_file.filename:
+            photo_data = photo_file.read()
+            photo_caption = request.form.get("photo_caption", "")
+            photo_mime = photo_file.mimetype or "image/jpeg"
+
+        order_id = order_service.create_order(
             client_id=client_id,
             service_id=service_id,
             description=request.form.get("description", ""),
@@ -228,20 +241,10 @@ def create_app() -> Flask:
             price=_price(request.form.get("price")),
             deadline=request.form.get("deadline", ""),
             status_id=_int(request.form.get("status_id", 1)) or 1,
+            photo_data=photo_data,
+            photo_caption=photo_caption,
+            photo_mime=photo_mime
         )
-
-        # Handle photo upload
-        photo_file = request.files.get("photo")
-        if photo_file and photo_file.filename:
-            photo_data = photo_file.read()
-            if photo_data:
-                d.add_order_photo(
-                    order_id=order_id,
-                    status_id=1,  # "принят"
-                    photo_data=photo_data,
-                    mime_type=photo_file.mimetype or "image/jpeg",
-                    caption=request.form.get("photo_caption", "")
-                )
 
         flash("Заказ создан")
         return redirect(url_for("orders"))
@@ -288,41 +291,18 @@ def create_app() -> Flask:
             photo_caption = request.form.get("photo_caption", "")
             photo_mime = photo_file.mimetype or "image/jpeg"
 
-        d.set_order_status(oid, status_id)
-
-        # Save photo if provided
-        if photo_data:
-            d.add_order_photo(
-                order_id=oid,
-                status_id=status_id,
-                photo_data=photo_data,
-                mime_type=photo_mime,
-                caption=photo_caption
-            )
-
-        # Notify client (with photo if provided)
-        client = d.get_client(order["client_id"])
-        channel_map = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_id"}
-        enabled = {c["channel"] for c in d.list_channels(order["client_id"]) if c["enabled"]}
-        channels = {
-            ch: client[channel_map[ch]]
-            for ch in enabled
-            if client[channel_map[ch]]
-        }
-        notifiers = build_notifiers()
-        # Use the latest photo for notification (either just uploaded or existing)
-        notify_photo = photo_data
-        notify_caption = f"Статус: {status['name']}\n{photo_caption}" if photo_caption else f"Статус: {status['name']}"
-        results = send_notifications(
-            channels,
-            order_status_message(order, status["name"]),
-            notifiers,
-            photo_data=notify_photo,
-            photo_caption=notify_caption,
+        success = order_service.change_status(
+            order_id=oid,
+            new_status_id=status_id,
+            photo_data=photo_data,
+            photo_caption=photo_caption,
             photo_mime=photo_mime
         )
-        sent = [k for k, v in results.items() if v]
-        flash("Статус изменён" + (f", уведомлено: {', '.join(sent)}" if sent else ""))
+
+        if success:
+            flash("Статус изменён, клиент уведомлён")
+        else:
+            flash("Ошибка при смене статуса")
         return redirect(url_for("order_detail", oid=oid))
 
     @app.post("/orders/<int:oid>/delete")
@@ -345,7 +325,7 @@ def create_app() -> Flask:
             return redirect(url_for("order_detail", oid=oid))
         quantity = _price(request.form.get("quantity")) or 1
         price = _price(request.form.get("price"))
-        d.add_service_to_order(oid, service_id, quantity=quantity, price=price)
+        order_service.add_extra_service(oid, service_id, quantity=quantity, price=price)
         flash("Доп. услуга добавлена")
         return redirect(url_for("order_detail", oid=oid))
 
@@ -355,7 +335,7 @@ def create_app() -> Flask:
         order = d.get_order(oid)
         if order is None:
             abort(404)
-        d.remove_service_from_order(oid, sid)
+        order_service.remove_extra_service(oid, sid)
         flash("Доп. услуга удалена")
         return redirect(url_for("order_detail", oid=oid))
 

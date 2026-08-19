@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from database import Database
 from db_schema import init_db, seed_defaults, migrate_db
-from notifier import build_notifiers, order_status_message, send_notifications
+from services.order_service import OrderService, NotificationPayload
 
 log = logging.getLogger("max_bot")
 
@@ -70,11 +70,13 @@ class MaxBot:
                  db_path: str = "instance/orders.db",
                  base_url: str = BASE_URL,
                  poll_timeout: int = 30,
-                 session: requests.Session | None = None):
+                 session: requests.Session | None = None,
+                 order_service: OrderService | None = None):
         self.token = token or os.environ.get("MAX_TOKEN", "")
         self.base_url = base_url
         self.admin_ids = {x.strip() for x in (admin_ids or os.environ.get("MAX_ADMIN_ID", "")).split(",") if x.strip()}
         self.db = Database(db_path)
+        self.order_service = order_service or OrderService(self.db)
         self.poll_timeout = poll_timeout
         self.marker = None
         self.session = session or requests.Session()
@@ -483,24 +485,15 @@ class MaxBot:
             self._clear_state(user_id)
             return
 
-        order_id = self.db.add_order(
+        order_id = self.order_service.create_order(
             client_id=data["client_id"],
             service_id=data["service_id"],
             description=data.get("description", ""),
             status_id=1,  # "принят"
+            photo_data=data.get("photo_data"),
+            photo_caption=f"Фото при создании заказа: {data.get('description', '')}",
+            photo_mime="image/jpeg"
         )
-
-        # Save photo if provided
-        if data.get("photo_data"):
-            self.db.add_order_photo(
-                order_id=order_id,
-                status_id=1,
-                photo_data=data["photo_data"],
-                caption=f"Фото при создании заказа: {data.get('description', '')}"
-            )
-
-        # Notify client with photo
-        self._notify_client_for_order(order_id, "принят", data.get("photo_data"), "Новый заказ создан")
 
         self._clear_state(user_id)
         self.answer_callback(callback_id,
@@ -643,20 +636,18 @@ class MaxBot:
             self._clear_state(user_id)
             return
 
-        # Update status
-        self.db.set_order_status(order_id, new_status_id)
+        success = self.order_service.change_status(
+            order_id=order_id,
+            new_status_id=new_status_id,
+            photo_data=photo_data,
+            photo_caption=f"Фото при смене на «{new_status_name}»",
+            photo_mime="image/jpeg"
+        )
 
-        # Save photo if provided
-        if photo_data:
-            self.db.add_order_photo(
-                order_id=order_id,
-                status_id=new_status_id,
-                photo_data=photo_data,
-                caption=f"Фото при смене на «{new_status_name}»"
-            )
-
-        # Notify client with photo
-        self._notify_client_for_order(order_id, new_status_name, photo_data, f"Статус: {new_status_name}")
+        if not success:
+            self.answer_callback(callback_id, "❌ Ошибка при смене статуса")
+            self._clear_state(user_id)
+            return
 
         self._clear_state(user_id)
         self.answer_callback(callback_id,
@@ -740,26 +731,6 @@ class MaxBot:
             self.answer_callback(callback_id, text, buttons)
         else:
             self.send_message(user_id, text, buttons)
-
-    # ---------- Notifications ----------
-
-    def _notify_client_for_order(self, order_id: int, status_name: str,
-                                  photo_data: bytes | None = None, photo_caption: str = "") -> None:
-        order = self.db.get_order(order_id)
-        if not order:
-            return
-        client = self.db.get_client(order["client_id"])
-        channel_map = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_id"}
-        enabled = {c["channel"] for c in self.db.list_channels(order["client_id"]) if c["enabled"]}
-        channels = {ch: client[channel_map[ch]] for ch in enabled if client[channel_map[ch]]}
-        send_notifications(
-            channels,
-            order_status_message(order, status_name),
-            build_notifiers(),
-            photo_data=photo_data,
-            photo_caption=photo_caption,
-            photo_mime="image/jpeg"
-        )
 
     def _status_emoji(self, status_name: str) -> str:
         emoji_map = {

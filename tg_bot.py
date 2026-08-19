@@ -20,7 +20,7 @@ from telegram.request import HTTPXRequest
 
 from database import Database
 from db_schema import init_db, seed_defaults, migrate_db
-from notifier import build_notifiers, order_status_message, send_notifications
+from services.order_service import OrderService, NotificationPayload
 
 log = logging.getLogger("tg_bot")
 
@@ -126,7 +126,7 @@ class TgBot:
         seed_defaults(db_path)
         migrate_db(db_path)
         self.db = Database(db_path)
-        self.notifiers = build_notifiers()
+        self.order_service = OrderService(self.db)
 
     def _check_admin(self, update: Update) -> bool:
         chat_id = str(update.effective_chat.id)
@@ -147,17 +147,14 @@ class TgBot:
 
     def _notify_client(self, order, status_name: str,
                      photo_data: bytes | None = None, photo_caption: str = "") -> None:
-        client = self.db.get_client(order["client_id"])
-        channel_map = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_id"}
-        enabled = {c["channel"] for c in self.db.list_channels(order["client_id"]) if c["enabled"]}
-        channels = {ch: client[channel_map[ch]] for ch in enabled if client[channel_map[ch]]}
-        send_notifications(
-            channels,
-            order_status_message(order, status_name),
-            self.notifiers,
-            photo_data=photo_data,
-            photo_caption=photo_caption,
-            photo_mime="image/jpeg"
+        self.order_service.notify_status_change(
+            order_id=order["id"],
+            status_name=status_name,
+            payload=NotificationPayload(
+                photo_data=photo_data,
+                photo_caption=photo_caption,
+                photo_mime="image/jpeg"
+            )
         )
 
     # ---------- Entry Points ----------

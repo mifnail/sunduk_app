@@ -5,9 +5,10 @@ from db_schema import init_db, seed_defaults
 
 
 class FakeResponse:
-    def __init__(self, json_data=None, status_code=200):
+    def __init__(self, json_data=None, status_code=200, text=""):
         self._json = json_data or {}
         self.status_code = status_code
+        self.text = text
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -23,11 +24,12 @@ class FakeSession:
 
     def post(self, url, **kwargs):
         self.requests.append(("POST", url, kwargs))
-        return FakeResponse({"success": True, "message": {}})
+        # Return response with text attribute for logging
+        return FakeResponse({"success": True, "message": {}}, text="OK")
 
     def get(self, url, **kwargs):
         self.requests.append(("GET", url, kwargs))
-        return FakeResponse({"updates": [], "marker": 1})
+        return FakeResponse({"updates": [], "marker": 1}, text="OK")
 
 
 def make_bot(db_path, admin_ids="1"):
