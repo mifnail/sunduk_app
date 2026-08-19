@@ -170,6 +170,8 @@ class TgBot:
         return MAIN_MENU
 
     async def _show_main_menu(self, update: Update) -> None:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         await self._send_or_edit(update, "🏠 <b>Главное меню</b>\nВыберите действие:", main_menu_keyboard())
 
     # ---------- Conversation Handlers ----------
@@ -215,6 +217,8 @@ class TgBot:
     # ---------- Menu ----------
 
     async def _handle_menu_callback(self, update: Update, action: str) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         if action == "main":
             await self._show_main_menu(update)
             return MAIN_MENU
@@ -236,6 +240,8 @@ class TgBot:
             await self._send_or_edit(update, "Сначала добавьте клиентов через веб-интерфейс.", back_button())
             return MAIN_MENU
 
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, CHOOSING_CLIENT)
         await self._send_or_edit(update, "👤 <b>Шаг 1/4: Выберите клиента</b>", clients_keyboard(clients))
         return CHOOSING_CLIENT
 
@@ -260,6 +266,8 @@ class TgBot:
             await self._send_or_edit(update, "Нет доступных услуг. Добавьте через веб-интерфейс.", back_button())
             return MAIN_MENU
 
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, CHOOSING_SERVICE)
         await self._send_or_edit(update, "🔧 <b>Шаг 2/4: Выберите основную услугу</b>", services_keyboard(services))
         return CHOOSING_SERVICE
 
@@ -281,6 +289,8 @@ class TgBot:
             [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_desc")],
             [InlineKeyboardButton("❌ Отмена", callback_data="menu:main")],
         ])
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, ENTERING_DESCRIPTION)
         await self._send_or_edit(update,
             f"📝 <b>Шаг 3/4: Введите описание заказа</b>\n"
             f"Услуга: {service['name']}\n"
@@ -290,11 +300,11 @@ class TgBot:
 
     async def _handle_skip_photo(self, update: Update) -> int:
         ctx = self._get_ctx(update)
-        state = self._get_state(ctx)
+        state = self._get_conversation_state(ctx)
 
         if state == AWAITING_STATUS_PHOTO:
             ctx.user_data["order_data"]["status_photo_data"] = None
-            return await self._confirm_status_change(update)
+            return await self._show_status_change_confirmation(update)
         elif state == AWAITING_PHOTO:
             ctx.user_data["order_data"]["photo_data"] = None
             return await self._show_order_confirmation(update)
@@ -310,6 +320,7 @@ class TgBot:
             text = ""
 
         ctx.user_data["order_data"]["description"] = text
+        self._set_conversation_state(ctx, AWAITING_PHOTO)
         await update.message.reply_text(
             "📷 <b>Шаг 4/4: Пришлите фото</b>\n"
             "Это может быть фото поломки, желаемой детали или эскиза.\n"
@@ -331,19 +342,17 @@ class TgBot:
         file = await ctx.bot.get_file(photo.file_id)
         photo_bytes = await file.download_as_bytearray()
 
-        state = self._get_state(ctx)
+        state = self._get_conversation_state(ctx)
         if state == AWAITING_STATUS_PHOTO:
             ctx.user_data["order_data"]["status_photo_data"] = bytes(photo_bytes)
+            return await self._show_status_change_confirmation(update)
         else:
             ctx.user_data["order_data"]["photo_data"] = bytes(photo_bytes)
-
-        if state == AWAITING_STATUS_PHOTO:
-            return await self._confirm_status_change(update)
-        else:
             return await self._show_order_confirmation(update)
 
     async def _show_order_confirmation(self, update: Update) -> int:
         ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, CONFIRMING_ORDER)
         data = ctx.user_data.get("order_data", {})
         text = (
             f"✅ <b>Подтвердите заказ</b>\n\n"
@@ -361,7 +370,7 @@ class TgBot:
         if action == "create_order":
             return await self._create_order(update)
         elif action == "change_status":
-            return await self._confirm_status_change(update)
+            return await self._execute_status_change(update)
         return MAIN_MENU
 
     async def _create_order(self, update: Update) -> int:
@@ -399,6 +408,8 @@ class TgBot:
     # ---------- Status Change Flow ----------
 
     async def _show_orders_list(self, update: Update) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         orders = self.db.list_orders()
         if not orders:
             await self._send_or_edit(update, "📋 Заказов пока нет.", back_button())
@@ -407,6 +418,8 @@ class TgBot:
         return MAIN_MENU
 
     async def _handle_order_callback(self, update: Update, order_id_str: str) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         if not order_id_str.isdigit():
             await self._answer_callback(update, "Неверный заказ")
             return MAIN_MENU
@@ -439,6 +452,8 @@ class TgBot:
         await self._send_or_edit(update, text, order_detail_keyboard(order["id"]))
 
     async def _handle_status_callback(self, update: Update, action: str, value: str, extra: str) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         if action == "change":
             return await self._start_status_change(update, int(value))
         elif action == "photos":
@@ -456,6 +471,7 @@ class TgBot:
         statuses = self.db.list_statuses()
         ctx = self._get_ctx(update)
         ctx.user_data["order_data"] = {"order_id": order_id}
+        self._set_conversation_state(ctx, CHOOSING_STATUS)
 
         await self._send_or_edit(update,
             f"🔄 Выберите новый статус для заказа #{order_id}:",
@@ -479,6 +495,7 @@ class TgBot:
             "new_status_id": status_id,
             "new_status_name": status["name"]
         })
+        self._set_conversation_state(ctx, AWAITING_STATUS_PHOTO)
 
         await self._send_or_edit(update,
             f"📷 <b>Пришлите фото для статуса «{status['name']}»</b>\n"
@@ -487,8 +504,9 @@ class TgBot:
             skip_photo_keyboard())
         return AWAITING_STATUS_PHOTO
 
-    async def _confirm_status_change(self, update: Update) -> int:
+    async def _show_status_change_confirmation(self, update: Update) -> int:
         ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, CONFIRMING_STATUS)
         data = ctx.user_data.get("order_data", {})
         order_id = data.get("order_id")
         status_name = data.get("new_status_name", "—")
@@ -503,7 +521,7 @@ class TgBot:
         await self._send_or_edit(update, text, confirm_keyboard("confirm:change_status", f"order:{order_id}"))
         return CONFIRMING_STATUS
 
-    async def _confirm_status_change(self, update: Update) -> int:
+    async def _execute_status_change(self, update: Update) -> int:
         ctx = self._get_ctx(update)
         data = ctx.user_data.get("order_data", {})
         order_id = data.get("order_id")
@@ -544,6 +562,8 @@ class TgBot:
         return MAIN_MENU
 
     async def _show_order_photos(self, update: Update, order_id: int) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         photos = self.db.get_order_photos(order_id)
         if not photos:
             await self._send_or_edit(update, "📷 Фото для этого заказа пока нет.", back_button(f"order:{order_id}"))
@@ -593,6 +613,8 @@ class TgBot:
         return MAIN_MENU
 
     async def _handle_extra_callback(self, update: Update, action: str, order_id_str: str, service_id_str: str) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         if action != "add" or not order_id_str.isdigit() or not service_id_str.isdigit():
             return MAIN_MENU
 
@@ -607,6 +629,8 @@ class TgBot:
     # ---------- Clients & Services Lists ----------
 
     async def _show_clients_list(self, update: Update) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         clients = self.db.list_clients()
         if not clients:
             await self._send_or_edit(update, "👥 Клиентов пока нет.", back_button())
@@ -615,6 +639,8 @@ class TgBot:
         return MAIN_MENU
 
     async def _show_services_list(self, update: Update) -> int:
+        ctx = self._get_ctx(update)
+        self._set_conversation_state(ctx, MAIN_MENU)
         services = self.db.list_services()
         if not services:
             await self._send_or_edit(update, "⚙️ Услуг пока нет.", back_button())
@@ -628,8 +654,12 @@ class TgBot:
     def _get_ctx(self, update: Update) -> ContextTypes.DEFAULT_TYPE:
         return update._context
 
-    def _get_state(self, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        return ctx.user_data.get("_state", MAIN_MENU)
+    def _get_conversation_state(self, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        # ConversationHandler stores state in a special key, but we can track it ourselves
+        return ctx.user_data.get("_conversation_state", MAIN_MENU)
+
+    def _set_conversation_state(self, ctx: ContextTypes.DEFAULT_TYPE, state: int) -> None:
+        ctx.user_data["_conversation_state"] = state
 
     # ---------- Run ----------
 
