@@ -115,7 +115,7 @@ def status_emoji(status_name: str) -> str:
 
 class TgBot:
     def __init__(self):
-        load_dotenv("/opt/sunduk_app/.env")
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
         self.token = os.environ.get("TG_TOKEN", "")
         self.admin_id = os.environ.get("TG_ADMIN_ID", "1054215343")
         db_path = os.environ.get(
