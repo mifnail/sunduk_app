@@ -24,6 +24,7 @@
   <thead>
     <tr>
       <th>№</th>
+      <th>Фото</th>
       <th>Клиент</th>
       <th>Услуга</th>
       <th>Описание</th>
@@ -36,6 +37,15 @@
     {% for o in orders %}
     <tr>
       <td><a href="{{ url_for('order_detail', oid=o.id) }}">#{{ o.id }}</a></td>
+      <td>
+        {% if o.latest_photo %}
+        <a href="{{ url_for('order_detail', oid=o.id) }}">
+          <img src="{{ url_for('order_photo', photo_id=o.latest_photo.id) }}" class="thumb" alt="фото">
+        </a>
+        {% else %}
+        —
+        {% endif %}
+      </td>
       <td>{{ o.client_name }}</td>
       <td>{{ o.service_name }}</td>
       <td>{{ o.description or '' }}</td>

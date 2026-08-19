@@ -107,3 +107,75 @@ td a { color: var(--accent); }
 .row button { flex: 0; margin-bottom: 10px; }
 .inline { display: inline; }
 .inline button { margin-left: 6px; }
+
+/* Photos grid */
+.photos-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.photo-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  text-align: center;
+}
+
+.photo-card img {
+  width: 100%;
+  height: 180px;
+  object-fit: cover;
+  border-bottom: 1px solid var(--border);
+}
+
+.photo-caption {
+  padding: 8px;
+  font-size: 13px;
+  color: #444;
+}
+
+.photo-caption strong {
+  display: block;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.photo-caption small {
+  color: #888;
+}
+
+/* Thumbnails in orders table */
+.thumb {
+  width: 50px;
+  height: 50px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+th, td { vertical-align: middle; }
+
+/* Sections in order detail */
+.photos-section, .extra-services-section, .status-change-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.photos-section h3, .extra-services-section h3, .status-change-section h3 {
+  font-size: 14px;
+  margin-bottom: 10px;
+  color: var(--accent);
+}
+
+.empty { color: #888; font-style: italic; }
+
+.extra-services-table th, .extra-services-table td {
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.order-header p { margin: 4px 0; }

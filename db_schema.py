@@ -70,8 +70,29 @@ CREATE TABLE IF NOT EXISTS notification_channels (
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status_id);
 CREATE INDEX IF NOT EXISTS idx_orders_client ON orders(client_id);
 CREATE INDEX IF NOT EXISTS idx_history_order ON order_status_history(order_id);
-"""
 
+-- Фото заказов, привязанные к статусу (история: фото поломки -> 3D-скан -> чертеж -> готовое)
+CREATE TABLE IF NOT EXISTS order_photos (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id     INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    status_id    INTEGER NOT NULL REFERENCES statuses(id),
+    photo_data   BLOB    NOT NULL,
+    mime_type    TEXT    NOT NULL DEFAULT 'image/jpeg',
+    caption      TEXT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_photos_order ON order_photos(order_id);
+
+-- Дополнительные услуги к заказу (many-to-many)
+CREATE TABLE IF NOT EXISTS order_services (
+    order_id   INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    quantity   REAL    NOT NULL DEFAULT 1,
+    price      REAL,  -- переопределение цены для этого заказа (опционально)
+    PRIMARY KEY (order_id, service_id)
+);
+"""
 
 def init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
@@ -96,6 +117,36 @@ def seed_defaults(db_path: str) -> None:
             (1, '3D-сканирование', 'шт', 1500),
             (2, '3D-печать', 'г', 4),
             (3, 'Постобработка', 'шт', 500);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def migrate_db(db_path: str) -> None:
+    """Создаёт новые таблицы, если их нет (для обновления существующей БД)."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS order_photos (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id     INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            status_id    INTEGER NOT NULL REFERENCES statuses(id),
+            photo_data   BLOB    NOT NULL,
+            mime_type    TEXT    NOT NULL DEFAULT 'image/jpeg',
+            caption      TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_photos_order ON order_photos(order_id);
+
+        CREATE TABLE IF NOT EXISTS order_services (
+            order_id   INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+            quantity   REAL    NOT NULL DEFAULT 1,
+            price      REAL,
+            PRIMARY KEY (order_id, service_id)
+        );
         """
     )
     conn.commit()

@@ -212,3 +212,138 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM order_status_history WHERE order_id = ?", (order_id,))
             conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+
+    # ---------- Фото заказов ----------
+
+    def add_order_photo(self, order_id: int, status_id: int, photo_data: bytes,
+                        mime_type: str = "image/jpeg", caption: str = "") -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO order_photos (order_id, status_id, photo_data, mime_type, caption) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (order_id, status_id, photo_data, mime_type, caption),
+            )
+            return int(cur.lastrowid)
+
+    def get_order_photos(self, order_id: int) -> Sequence[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT p.*, s.name AS status_name FROM order_photos p "
+                "JOIN statuses s ON s.id = p.status_id "
+                "WHERE p.order_id = ? ORDER BY p.created_at",
+                (order_id,)
+            ).fetchall()
+
+    def get_latest_photo(self, order_id: int) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT p.*, s.name AS status_name FROM order_photos p "
+                "JOIN statuses s ON s.id = p.status_id "
+                "WHERE p.order_id = ? ORDER BY p.created_at DESC LIMIT 1",
+                (order_id,)
+            ).fetchone()
+
+    # ---------- Дополнительные услуги заказа ----------
+
+    def add_service_to_order(self, order_id: int, service_id: int,
+                             quantity: float = 1, price: Optional[float] = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO order_services (order_id, service_id, quantity, price) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(order_id, service_id) DO UPDATE SET "
+                "quantity = excluded.quantity, price = excluded.price",
+                (order_id, service_id, quantity, price),
+            )
+
+    def get_order_services(self, order_id: int) -> Sequence[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT os.*, s.name, s.unit, s.price AS default_price "
+                "FROM order_services os "
+                "JOIN services s ON s.id = os.service_id "
+                "WHERE os.order_id = ?",
+                (order_id,)
+            ).fetchall()
+
+    def remove_service_from_order(self, order_id: int, service_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM order_services WHERE order_id = ? AND service_id = ?",
+                (order_id, service_id),
+            )
+
+    def calculate_order_total(self, order_id: int) -> float:
+        """Итоговая сумма: основная услуга + доп. услуги."""
+        with self.connect() as conn:
+            # Основная услуга
+            row = conn.execute(
+                "SELECT price FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            total = row["price"] if row and row["price"] else 0.0
+
+            # Доп. услуги
+            rows = conn.execute(
+                "SELECT COALESCE(os.price, s.price) * quantity AS subtotal "
+                "FROM order_services os "
+                "JOIN services s ON s.id = os.service_id "
+                "WHERE os.order_id = ?",
+                (order_id,)
+            ).fetchall()
+            total += sum(r["subtotal"] for r in rows if r["subtotal"])
+            return total
+
+    def get_order_photo(self, photo_id: int) -> Optional[sqlite3.Row]:
+        """Получает фото по ID для отдачи клиенту."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM order_photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+
+    def list_orders_with_photos(self, status_id: Optional[int] = None,
+                                 client_id: Optional[int] = None) -> Sequence[sqlite3.Row]:
+        """Список заказов с последним фото для превью."""
+        query = (
+            "SELECT o.*, c.full_name AS client_name, s.name AS service_name, "
+            "st.name AS status_name, "
+            "(SELECT p.id FROM order_photos p WHERE p.order_id = o.id ORDER BY p.created_at DESC LIMIT 1) AS latest_photo_id "
+            "FROM orders o "
+            "JOIN clients c ON c.id = o.client_id "
+            "JOIN services s ON s.id = o.service_id "
+            "JOIN statuses st ON st.id = o.status_id "
+        )
+        where, params = [], []
+        if status_id is not None:
+            where.append("o.status_id = ?")
+            params.append(status_id)
+        if client_id is not None:
+            where.append("o.client_id = ?")
+            params.append(client_id)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY o.created_at DESC"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            # Convert to list to add latest_photo attribute
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict["latest_photo_id"]:
+                    photo = self.get_order_photo(row_dict["latest_photo_id"])
+                    row_dict["latest_photo"] = photo
+                else:
+                    row_dict["latest_photo"] = None
+                result.append(row_dict)
+            return result
+
+    def calculate_extra_total(self, order_id: int) -> float:
+        """Сумма только доп. услуг."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(os.price, s.price) * quantity AS subtotal "
+                "FROM order_services os "
+                "JOIN services s ON s.id = os.service_id "
+                "WHERE os.order_id = ?",
+                (order_id,)
+            ).fetchall()
+            return sum(r["subtotal"] for r in rows if r["subtotal"])
