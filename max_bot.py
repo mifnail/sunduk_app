@@ -35,6 +35,7 @@ class State(Enum):
     # Status change flow
     CHOOSING_STATUS = "choosing_status"
     AWAITING_STATUS_PHOTO = "awaiting_status_photo"
+    CONFIRMING_STATUS_CHANGE = "confirming_status_change"
     # View order
     VIEWING_ORDER = "viewing_order"
 
@@ -97,7 +98,7 @@ class MaxBot:
             json=body,
             timeout=15,
         )
-        log.info("send_message ← %s %s", resp.status_code, resp.text[:200] if hasattr(resp, 'text') else str(resp))
+        log.info("send_message ← %s %s", resp.status_code, resp.text[:200])
         resp.raise_for_status()
         return True
 
@@ -276,7 +277,7 @@ class MaxBot:
                 if att.get("type") == "photo":
                     photo_data = self.download_photo(att)
                     if photo_data:
-                        self._handle_photo(user_id, photo_data)
+                        self._handle_photo(user_id, photo_data, state)
                     else:
                         self.send_message(user_id, "Не удалось загрузить фото. Попробуйте ещё раз.", cancel_button())
                     return
@@ -313,7 +314,7 @@ class MaxBot:
             elif action == "order":
                 self._handle_order_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "")
             elif action == "neworder":
-                self._handle_new_order_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "")
+                self._handle_new_order_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
             elif action == "skip_photo":
                 self._handle_skip_photo(user_id, callback_id)
             elif action == "confirm":
@@ -417,12 +418,21 @@ class MaxBot:
             skip_photo_button() + cancel_button())
 
     def _handle_skip_photo(self, user_id: str, callback_id: str) -> None:
-        self._update_data(user_id, photo_data=None)
-        self._show_order_confirmation(user_id, callback_id)
+        state = self._get_state(user_id)
+        if state == State.AWAITING_STATUS_PHOTO:
+            self._update_data(user_id, status_photo_data=None)
+            self._show_status_change_confirmation(user_id, callback_id)
+        elif state == State.AWAITING_PHOTO:
+            self._update_data(user_id, photo_data=None)
+            self._show_order_confirmation(user_id, callback_id)
 
-    def _handle_photo(self, user_id: str, photo_data: bytes) -> None:
-        self._update_data(user_id, photo_data=photo_data)
-        self._show_order_confirmation(user_id, None)
+    def _handle_photo(self, user_id: str, photo_data: bytes, state: State) -> None:
+        if state == State.AWAITING_STATUS_PHOTO:
+            self._update_data(user_id, status_photo_data=photo_data)
+            self._show_status_change_confirmation(user_id, None)
+        else:  # AWAITING_PHOTO
+            self._update_data(user_id, photo_data=photo_data)
+            self._show_order_confirmation(user_id, None)
 
     def _show_order_confirmation(self, user_id: str, callback_id: str | None) -> None:
         data = self._get_data(user_id)
@@ -439,11 +449,29 @@ class MaxBot:
         else:
             self.send_message(user_id, text, buttons)
 
+    def _show_status_change_confirmation(self, user_id: str, callback_id: str | None) -> None:
+        data = self._get_data(user_id)
+        order_id = data.get("order_id")
+        status_name = data.get("new_status_name", "—")
+        has_photo = "✅ есть" if data.get("status_photo_data") else "❌ нет"
+
+        text = (
+            f"✅ <b>Подтвердите смену статуса</b>\n\n"
+            f"Заказ: #{order_id}\n"
+            f"Новый статус: {status_name}\n"
+            f"Фото: {has_photo}"
+        )
+        buttons = confirm_keyboard("confirm:change_status", f"order:{order_id}")
+        if callback_id:
+            self.answer_callback(callback_id, text, buttons)
+        else:
+            self.send_message(user_id, text, buttons)
+
     def _handle_confirm(self, user_id: str, callback_id: str, action: str) -> None:
         if action == "create_order":
             self._create_order(user_id, callback_id)
         elif action == "change_status":
-            self._confirm_status_change(user_id, callback_id)
+            self._execute_status_change(user_id, callback_id)
         else:
             self.answer_callback(callback_id, "Неизвестное подтверждение")
 
@@ -551,11 +579,7 @@ class MaxBot:
             self._show_order_photos(user_id, callback_id, int(value))
         elif action == "extra":
             self._show_extra_services(user_id, callback_id, int(value))
-        elif action == "set":
-            order_id = int(parts[1]) if len(parts) > 1 else 0
-            status_id = int(parts[2]) if len(parts) > 2 else 0
-            # This is handled in _handle_new_order_callback for status selection during order creation
-            pass
+        # "set" action removed - was dead code referencing undefined 'parts'
 
     def _start_status_change(self, user_id: str, callback_id: str, order_id: int) -> None:
         order = self.db.get_order(order_id)
@@ -580,49 +604,28 @@ class MaxBot:
         self._set_state(user_id, State.CHOOSING_STATUS, {"order_id": order_id})
         self.answer_callback(callback_id, f"🔄 Выберите новый статус для заказа #{order_id}:", buttons)
 
-    def _handle_new_order_callback(self, user_id: str, callback_id: str, action: str) -> None:
+    def _handle_new_order_callback(self, user_id: str, callback_id: str, action: str, value: str) -> None:
         """Handles callbacks with 'neworder:' prefix used in status selection."""
-        parts = action.split(":")
-        if parts[0] == "status" and len(parts) == 3:
-            order_id = int(parts[1])
-            status_id = int(parts[2])
-            status = self.db.get_status(status_id)
-            if not status:
-                self.answer_callback(callback_id, "Статус не найден")
-                return
-            self._update_data(user_id, new_status_id=status_id, new_status_name=status["name"])
-            self._set_state(user_id, State.AWAITING_STATUS_PHOTO)
-            self.answer_callback(callback_id,
-                f"📷 <b>Пришлите фото для статуса «{status['name']}»</b>\n"
-                f"Например: 3D-скан, чертеж, фото готового изделия.\n"
-                f"Можно пропустить.",
-                skip_photo_button() + [[{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}]])
+        if action != "status" or not value.isdigit():
+            return
+        parts = value.split(":")
+        if len(parts) != 2:
+            return
+        order_id = int(parts[0])
+        status_id = int(parts[1])
+        status = self.db.get_status(status_id)
+        if not status:
+            self.answer_callback(callback_id, "Статус не найден")
+            return
+        self._update_data(user_id, new_status_id=status_id, new_status_name=status["name"])
+        self._set_state(user_id, State.AWAITING_STATUS_PHOTO)
+        self.answer_callback(callback_id,
+            f"📷 <b>Пришлите фото для статуса «{status['name']}»</b>\n"
+            f"Например: 3D-скан, чертеж, фото готового изделия.\n"
+            f"Можно пропустить.",
+            skip_photo_button() + [[{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}]])
 
-    def _handle_skip_photo(self, user_id: str, callback_id: str) -> None:
-        state = self._get_state(user_id)
-        if state == State.AWAITING_STATUS_PHOTO:
-            self._update_data(user_id, status_photo_data=None)
-            self._confirm_status_change(user_id, callback_id)
-        elif state == State.AWAITING_PHOTO:
-            self._update_data(user_id, photo_data=None)
-            self._show_order_confirmation(user_id, callback_id)
-
-    def _confirm_status_change(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        order_id = data.get("order_id")
-        status_name = data.get("new_status_name", "—")
-        has_photo = "✅ есть" if data.get("status_photo_data") else "❌ нет"
-
-        text = (
-            f"✅ <b>Подтвердите смену статуса</b>\n\n"
-            f"Заказ: #{order_id}\n"
-            f"Новый статус: {status_name}\n"
-            f"Фото: {has_photo}"
-        )
-        buttons = confirm_keyboard("confirm:change_status", f"order:{order_id}")
-        self.answer_callback(callback_id, text, buttons)
-
-    def _confirm_status_change(self, user_id: str, callback_id: str) -> None:
+    def _execute_status_change(self, user_id: str, callback_id: str) -> None:
         data = self._get_data(user_id)
         order_id = data.get("order_id")
         new_status_id = data.get("new_status_id")
@@ -644,7 +647,6 @@ class MaxBot:
         self.db.set_order_status(order_id, new_status_id)
 
         # Save photo if provided
-        photo_data = data.get("status_photo_data")
         if photo_data:
             self.db.add_order_photo(
                 order_id=order_id,
@@ -788,13 +790,6 @@ class MaxBot:
             except Exception as exc:
                 log.warning("Ошибка Long Polling: %s", exc)
                 time.sleep(5)
-
-
-def _to_int(value: str) -> int | None:
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
 
 
 def main() -> None:
