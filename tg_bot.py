@@ -9,7 +9,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
@@ -72,6 +72,16 @@ def confirm_keyboard(confirm_cb: str, cancel_cb: str = "menu:main") -> InlineKey
         [InlineKeyboardButton("✅ Подтвердить", callback_data=confirm_cb)],
         [InlineKeyboardButton("❌ Отмена", callback_data=cancel_cb)],
     ])
+
+def contact_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)],
+            [KeyboardButton(text="⏭ Пропустить")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 def clients_keyboard(clients) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton("➕ Создать клиента", callback_data="client:create")]]
@@ -181,12 +191,31 @@ class TgBot:
         if not self._check_admin(update):
             await update.message.reply_text("Доступ запрещён: вы не оператор студии.")
             return ConversationHandler.END
-        await self._show_main_menu(update, ctx)
+
+        # Deep link обработка
+        args = ctx.args
+        if args and args[0].startswith("link_"):
+            return await self._handle_link_token(update, ctx, args[0][5:])
+
+        # Показываем запрос контакта
+        await update.message.reply_text(
+            "👋 Добро пожаловать в студию 3D-печати!\n\n"
+            "Для получения уведомлений о заказах нажмите кнопку ниже:",
+            reply_markup=contact_request_keyboard()
+        )
         return MAIN_MENU
 
     async def _show_main_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         self._set_conversation_state(ctx, MAIN_MENU)
         await self._send_or_edit(update, "🏠 <b>Главное меню</b>\nВыберите действие:", main_menu_keyboard())
+
+    async def _handle_link_token(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, token: str) -> int:
+        """Заглушка для deep-link токенов — привязка по номеру через /start."""
+        await update.message.reply_text(
+            "🔗 Ссылка не активна. Используйте кнопку ниже для привязки по номеру:",
+            reply_markup=contact_request_keyboard()
+        )
+        return MAIN_MENU
 
     # ---------- Conversation Handlers ----------
 
@@ -240,6 +269,13 @@ class TgBot:
                 return await self._handle_confirm(update, ctx, parts[1] if len(parts) > 1 else "")
             elif action == "extra":
                 return await self._handle_extra_callback(update, ctx, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "")
+            elif action == "bind_client" and parts[1].isdigit():
+                client_id = int(parts[1])
+                self.db.update_client(client_id, telegram_id=str(update.effective_chat.id))
+                self.db.set_channel(client_id, "telegram", True)
+                await query.answer("✅ Привязано!")
+                await self._show_main_menu(update, ctx)
+                return MAIN_MENU
         except Exception as exc:
             log.exception("Ошибка callback: %s", exc)
             await query.answer("❌ Ошибка. Попробуйте снова.", show_alert=True)
@@ -1003,7 +1039,11 @@ class TgBot:
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("start", self.cmd_start)],
             states={
-                MAIN_MENU: [CallbackQueryHandler(self.callback_handler)],
+                MAIN_MENU: [
+                    CallbackQueryHandler(self.callback_handler),
+                    MessageHandler(filters.CONTACT, self.contact_handler),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_fallback_handler),
+                ],
                 CHOOSING_CLIENT: [CallbackQueryHandler(self.callback_handler)],
                 CHOOSING_SERVICE: [CallbackQueryHandler(self.callback_handler)],
                 ENTERING_DESCRIPTION: [
@@ -1052,6 +1092,62 @@ class TgBot:
         app.add_handler(conv_handler)
         log.info("TG-бот запущен (Long Polling)")
         app.run_polling(drop_pending_updates=True)
+
+    async def contact_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        contact = update.message.contact
+        if not contact or not contact.phone_number:
+            await update.message.reply_text("❌ Не удалось получить номер. Попробуйте снова.",
+                                            reply_markup=contact_request_keyboard())
+            return MAIN_MENU
+
+        phone = self.db._normalize_phone(contact.phone_number)
+        clients = self.db.get_client_by_phone(phone)
+
+        if not clients:
+            await update.message.reply_text(
+                "❌ Номер не найден в базе клиентов.\n"
+                "Обратитесь к оператору для регистрации.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self._show_main_menu(update, ctx)
+            return MAIN_MENU
+
+        if len(clients) == 1:
+            client = clients[0]
+            self.db.update_client(client["id"], telegram_id=str(update.effective_chat.id))
+            self.db.set_channel(client["id"], "telegram", True)
+            await update.message.reply_text(
+                f"✅ <b>Аккаунт привязан!</b>\n"
+                f"Здравствуйте, {client['full_name']}!\n"
+                f"Теперь вы будете получать уведомления о заказах.",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self._show_main_menu(update, ctx)
+            return MAIN_MENU
+
+        # Несколько клиентов — показываем выбор
+        buttons = []
+        for c in clients[:10]:
+            buttons.append([InlineKeyboardButton(f"{c['full_name']} ({c['phone']})",
+                                                  callback_data=f"bind_client:{c['id']}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="menu:main")])
+        await update.message.reply_text(
+            f"🔍 Найдено {len(clients)} клиентов. Выберите себя:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return MAIN_MENU
+
+    async def text_fallback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip().lower()
+        if text in ("пропустить", "skip", "⏭ пропустить"):
+            await update.message.reply_text(
+                "Хорошо, можно привязать позже.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self._show_main_menu(update, ctx)
+            return MAIN_MENU
+        return MAIN_MENU
 
     async def cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data.clear()

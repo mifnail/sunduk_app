@@ -276,11 +276,55 @@ class MaxBot:
         user_id = self._sender_id(update)
         if user_id:
             self._clear_state(user_id)
-            self._show_main_menu(user_id)
+            self._show_contact_request(user_id)
+
+    def _show_contact_request(self, user_id: str) -> None:
+        self._set_state(user_id, State.MAIN_MENU, {})
+        # MAX поддерживает request_contact в кнопках
+        buttons = [
+            [{"type": "callback", "text": "📱 Отправить мой номер", "payload": "request_contact"}],
+            [{"type": "callback", "text": "⏭ Пропустить", "payload": "skip_contact"}],
+        ]
+        self.send_message(user_id,
+            "👋 Добро пожаловать в студию 3D-печати!\n\n"
+            "Для получения уведомлений о заказах нажмите кнопку ниже:",
+            buttons)
 
     def _show_main_menu(self, user_id: str) -> None:
         self._set_state(user_id, State.MAIN_MENU)
         self.send_message(user_id, "🏠 <b>Главное меню</b>\nВыберите действие:", main_menu_keyboard())
+
+    def _handle_contact(self, user_id: str, phone: str) -> None:
+        normalized = self.db._normalize_phone(phone)
+        clients = self.db.get_client_by_phone(normalized)
+
+        if not clients:
+            self.send_message(user_id,
+                "❌ Номер не найден в базе клиентов.\n"
+                "Обратитесь к оператору для регистрации.",
+                back_button("menu:main"))
+            return
+
+        if len(clients) == 1:
+            client = clients[0]
+            self.db.update_client(client["id"], max_id=user_id)
+            self.db.set_channel(client["id"], "max", True)
+            self.send_message(user_id,
+                f"✅ <b>Аккаунт привязан!</b>\n"
+                f"Здравствуйте, {client['full_name']}!\n"
+                f"Теперь вы будете получать уведомления о заказах.",
+                back_button("menu:main"))
+            return
+
+        # Несколько клиентов — показываем выбор
+        buttons = []
+        for c in clients[:10]:
+            buttons.append([{"type": "callback", "text": f"{c['full_name']} ({c['phone']})",
+                             "payload": f"bind_client:{c['id']}"}])
+        buttons.append([{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}])
+        self.send_message(user_id,
+            f"🔍 Найдено {len(clients)} клиентов. Выберите себя:",
+            buttons)
 
     # ---------- Message Handler (text + photo) ----------
 
@@ -305,6 +349,15 @@ class MaxBot:
                     else:
                         self.send_message(user_id, "Не удалось загрузить фото. Попробуйте ещё раз.", cancel_button())
                     return
+
+        # Handle contact attachments (MAX посылает contact в attachment)
+        for att in attachments:
+            if att.get("type") == "contact":
+                contact = att.get("payload") or {}
+                phone = contact.get("phone_number") or contact.get("phone") or ""
+                if phone:
+                    self._handle_contact(user_id, phone)
+                return
 
         # Handle text input based on state
         if state == State.ENTERING_DESCRIPTION:
@@ -369,6 +422,23 @@ class MaxBot:
                 self._handle_edit_field(user_id, callback_id, parts[1] if len(parts) > 1 else "")
             elif action == "cancel":
                 self._handle_cancel(user_id, callback_id)
+            elif action == "request_contact":
+                # MAX не поддерживает programmatic request_contact через callback,
+                # но мы можем показать инструкцию
+                self.answer_callback(callback_id,
+                    "📱 Нажмите на кнопку «Поделиться контактом» в клавиатуре ниже и отправьте свой номер:",
+                    [[{"type": "callback", "text": "📱 Поделиться контактом", "payload": "share_contact"}],
+                     [{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]])
+            elif action == "skip_contact":
+                self.answer_callback(callback_id, "Хорошо, можно привязать позже.")
+                self._clear_state(user_id)
+                self._show_main_menu(user_id)
+            elif action == "bind_client" and len(parts) > 1 and parts[1].isdigit():
+                client_id = int(parts[1])
+                self.db.update_client(client_id, max_id=user_id)
+                self.db.set_channel(client_id, "max", True)
+                self.answer_callback(callback_id, "✅ Привязано!", back_button("menu:main"))
+                self._show_main_menu(user_id)
         except Exception as exc:
             log.exception("Ошибка обработки callback: %s", exc)
             self.answer_callback(callback_id, "❌ Произошла ошибка. Попробуйте снова.")

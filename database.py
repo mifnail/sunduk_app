@@ -32,6 +32,26 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
 
+    @staticmethod
+    def _normalize_phone(phone: str) -> str:
+        """Привести к формату 7XXXXXXXXXX (только цифры)."""
+        import re
+        digits = re.sub(r"\D", "", phone)
+        if digits.startswith("8") and len(digits) == 11:
+            digits = "7" + digits[1:]
+        elif digits.startswith("9") and len(digits) == 10:
+            digits = "7" + digits
+        return digits
+
+    def get_client_by_phone(self, phone: str) -> Sequence[sqlite3.Row]:
+        """Найти клиентов по номеру телефона."""
+        normalized = self._normalize_phone(phone)
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM clients WHERE REPLACE(REPLACE(REPLACE(phone, '+', ''), '-', ''), ' ', '') LIKE ?",
+                (f"%{normalized}%",)
+            ).fetchall()
+
     def update_client(self, client_id: int, **fields: Any) -> None:
         allowed = {"full_name", "phone", "telegram_id", "vk_id", "max_id", "notes"}
         sets = {k: v for k, v in fields.items() if k in allowed}
