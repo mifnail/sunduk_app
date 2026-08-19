@@ -311,6 +311,49 @@ def create_app() -> Flask:
         flash("Заказ удалён")
         return redirect(url_for("orders"))
 
+    # ---------- Редактирование заказа ----------
+    
+    @app.get("/orders/<int:oid>/edit")
+    def order_edit(oid: int):
+        d = db()
+        order = d.get_order(oid)
+        if order is None:
+            abort(404)
+        return render_template(
+            "order_detail.html",
+            order=order,
+            history=d.order_history(oid),
+            statuses=d.list_statuses(),
+            photos=d.get_order_photos(oid),
+            extra_services=d.get_order_services(oid),
+            extra_total=d.calculate_extra_total(oid),
+            services=d.list_services(),
+            edit_mode=True,
+        )
+
+    @app.post("/orders/<int:oid>/edit")
+    def order_update(oid: int):
+        d = db()
+        order = d.get_order(oid)
+        if order is None:
+            abort(404)
+        
+        description = request.form.get("description", "").strip()
+        model_file = request.form.get("model_file", "").strip()
+        price = _price(request.form.get("price"))
+        deadline = request.form.get("deadline", "").strip()
+        
+        d.update_order(
+            oid,
+            description=description,
+            model_file=model_file,
+            price=price,
+            deadline=deadline,
+        )
+        
+        flash("Заказ обновлён")
+        return redirect(url_for("order_detail", oid=oid))
+
     # ---------- Дополнительные услуги к заказу ----------
 
     @app.post("/orders/<int:oid>/extra/add")

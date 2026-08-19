@@ -28,7 +28,16 @@ log = logging.getLogger("tg_bot")
     MAIN_MENU,
     CHOOSING_CLIENT, CHOOSING_SERVICE, ENTERING_DESCRIPTION, AWAITING_PHOTO, CONFIRMING_ORDER,
     CHOOSING_STATUS, AWAITING_STATUS_PHOTO, CONFIRMING_STATUS,
-) = range(9)
+    # Client management
+    CHOOSING_CLIENT_ACTION,
+    ENTERING_CLIENT_NAME, ENTERING_CLIENT_PHONE, ENTERING_CLIENT_TG_ID,
+    ENTERING_CLIENT_VK_ID, ENTERING_CLIENT_MAX_ID, ENTERING_CLIENT_NOTES,
+    CONFIRMING_CLIENT_CREATE, CONFIRMING_CLIENT_UPDATE, CONFIRMING_CLIENT_DELETE,
+    # Order edit
+    CHOOSING_ORDER_EDIT_FIELD,
+    EDITING_ORDER_DESCRIPTION, EDITING_ORDER_PRICE, EDITING_ORDER_DEADLINE,
+    CONFIRMING_ORDER_EDIT, CONFIRMING_ORDER_DELETE,
+) = range(25)
 
 # ---------- Keyboards ----------
 
@@ -46,6 +55,12 @@ def back_button(target: str = "menu:main") -> InlineKeyboardMarkup:
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:main")]])
 
+def skip_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="menu:main")]
+    ])
+
 def skip_photo_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ Пропустить фото", callback_data="skip_photo")],
@@ -59,7 +74,10 @@ def confirm_keyboard(confirm_cb: str, cancel_cb: str = "menu:main") -> InlineKey
     ])
 
 def clients_keyboard(clients) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(f"{c['full_name']} ({c['phone'] or '—'})", callback_data=f"client:{c['id']}")] for c in clients[:20]]
+    buttons = [[InlineKeyboardButton("➕ Создать клиента", callback_data="client:create")]]
+    for c in clients[:20]:
+        row = [InlineKeyboardButton(f"{c['full_name']} ({c['phone'] or '—'})", callback_data=f"client:view:{c['id']}")]
+        buttons.append(row)
     buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="menu:main")])
     return InlineKeyboardMarkup(buttons)
 
@@ -88,6 +106,8 @@ def order_detail_keyboard(order_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Сменить статус", callback_data=f"status:change:{order_id}")],
         [InlineKeyboardButton("📸 История фото", callback_data=f"status:photos:{order_id}")],
         [InlineKeyboardButton("➕ Доп. услуги", callback_data=f"status:extra:{order_id}")],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data=f"order:edit:{order_id}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"order:delete:{order_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu:orders")],
     ])
 
@@ -187,7 +207,23 @@ class TgBot:
             if action == "menu":
                 return await self._handle_menu_callback(update, ctx, parts[1] if len(parts) > 1 else "main")
             elif action == "client":
-                return await self._handle_client_callback(update, ctx, parts[1] if len(parts) > 1 else "")
+                sub_action = parts[1] if len(parts) > 1 else ""
+                client_id_str = parts[2] if len(parts) > 2 else ""
+                if sub_action == "create":
+                    return await self._start_create_client(update, ctx)
+                elif sub_action == "view" and client_id_str.isdigit():
+                    return await self._show_client_detail(update, ctx, int(client_id_str))
+                elif sub_action == "edit" and client_id_str.isdigit():
+                    return await self._start_edit_client(update, ctx, int(client_id_str))
+                elif sub_action == "delete" and client_id_str.isdigit():
+                    return await self._confirm_delete_client(update, ctx, int(client_id_str))
+                return MAIN_MENU
+            elif action == "client_ch":
+                return await self._handle_client_channel_toggle(update, ctx, parts[1] if len(parts) > 1 else "")
+            elif action == "edit_field":
+                return await self._handle_client_field_edit(update, ctx, parts[1] if len(parts) > 1 else "")
+            elif action == "edit_order_field":
+                return await self._handle_order_field_edit(update, ctx, parts[1] if len(parts) > 1 else "")
             elif action == "service":
                 return await self._handle_service_callback(update, ctx, parts[1] if len(parts) > 1 else "")
             elif action == "status":
@@ -372,6 +408,10 @@ class TgBot:
             return await self._create_order(update, ctx)
         elif action == "change_status":
             return await self._execute_status_change(update, ctx)
+        elif action in ("create_client", "update_client", "delete_client"):
+            return await self._handle_client_confirmation(update, ctx, action)
+        elif action in ("update_order", "delete_order"):
+            return await self._handle_order_confirmation(update, ctx, action)
         return MAIN_MENU
 
     async def _create_order(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -407,18 +447,25 @@ class TgBot:
             await self._send_or_edit(update, "📋 <b>Список заказов</b> (последние 20):", orders_list_keyboard(orders))
         return MAIN_MENU
 
-    async def _handle_order_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, order_id_str: str) -> int:
+    async def _handle_order_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, sub_action: str) -> int:
         self._set_conversation_state(ctx, MAIN_MENU)
-        if not order_id_str.isdigit():
-            await self._answer_callback(update, "Неверный заказ")
+        parts = sub_action.split(":")
+        action = parts[0] if parts else ""
+        order_id_str = parts[1] if len(parts) > 1 else ""
+        
+        if action == "view" or (action == "" and order_id_str.isdigit()):
+            order_id = int(order_id_str)
+            order = self.db.get_order(order_id)
+            if not order:
+                await self._answer_callback(update, "Заказ не найден")
+                return MAIN_MENU
+            await self._show_order_detail(update, ctx, order)
             return MAIN_MENU
-
-        order = self.db.get_order(int(order_id_str))
-        if not order:
-            await self._answer_callback(update, "Заказ не найден")
-            return MAIN_MENU
-
-        await self._show_order_detail(update, ctx, order)
+        elif action == "edit" and order_id_str.isdigit():
+            return await self._start_edit_order(update, ctx, int(order_id_str))
+        elif action == "delete" and order_id_str.isdigit():
+            return await self._confirm_delete_order(update, ctx, int(order_id_str))
+        
         return MAIN_MENU
 
     async def _show_order_detail(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, order) -> None:
@@ -630,6 +677,306 @@ class TgBot:
             await self._send_or_edit(update, text, InlineKeyboardMarkup(buttons))
         return MAIN_MENU
 
+    # ---------- Client CRUD ----------
+
+    async def _start_create_client(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        self._set_conversation_state(ctx, ENTERING_CLIENT_NAME)
+        ctx.user_data["client_data"] = {}
+        await self._send_or_edit(update, "👤 <b>Создание клиента</b>\nВведите ФИО (обязательно):", cancel_keyboard())
+        return ENTERING_CLIENT_NAME
+
+    async def client_name_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        name = update.message.text.strip()
+        if not name:
+            await update.message.reply_text("ФИО не может быть пустым. Введите снова:", reply_markup=cancel_keyboard())
+            return ENTERING_CLIENT_NAME
+        ctx.user_data["client_data"]["full_name"] = name
+        self._set_conversation_state(ctx, ENTERING_CLIENT_PHONE)
+        await update.message.reply_text("📞 Телефон (или «пропустить»):", reply_markup=skip_button())
+        return ENTERING_CLIENT_PHONE
+
+    async def client_phone_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["client_data"]["phone"] = "" if text.lower() in ("пропустить", "skip", "-") else text
+        self._set_conversation_state(ctx, ENTERING_CLIENT_TG_ID)
+        await update.message.reply_text("🤖 Telegram ID (или «пропустить»):", reply_markup=skip_button())
+        return ENTERING_CLIENT_TG_ID
+
+    async def client_tg_id_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["client_data"]["telegram_id"] = "" if text.lower() in ("пропустить", "skip", "-") else text
+        self._set_conversation_state(ctx, ENTERING_CLIENT_VK_ID)
+        await update.message.reply_text("🔵 VK ID (или «пропустить»):", reply_markup=skip_button())
+        return ENTERING_CLIENT_VK_ID
+
+    async def client_vk_id_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["client_data"]["vk_id"] = "" if text.lower() in ("пропустить", "skip", "-") else text
+        self._set_conversation_state(ctx, ENTERING_CLIENT_MAX_ID)
+        await update.message.reply_text("🟣 MAX ID (или «пропустить»):", reply_markup=skip_button())
+        return ENTERING_CLIENT_MAX_ID
+
+    async def client_max_id_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["client_data"]["max_id"] = "" if text.lower() in ("пропустить", "skip", "-") else text
+        self._set_conversation_state(ctx, ENTERING_CLIENT_NOTES)
+        await update.message.reply_text("📝 Заметки (или «пропустить»):", reply_markup=skip_button())
+        return ENTERING_CLIENT_NOTES
+
+    async def client_notes_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["client_data"]["notes"] = "" if text.lower() in ("пропустить", "skip", "-") else text
+        self._set_conversation_state(ctx, CONFIRMING_CLIENT_CREATE)
+        await self._show_client_confirmation(update, ctx)
+        return CONFIRMING_CLIENT_CREATE
+
+    async def _show_client_confirmation(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        data = ctx.user_data.get("client_data", {})
+        text = (
+            f"✅ <b>Подтвердите создание клиента</b>\n\n"
+            f"ФИО: {data.get('full_name', '—')}\n"
+            f"Телефон: {data.get('phone', '—') or '—'}\n"
+            f"Telegram ID: {data.get('telegram_id', '—') or '—'}\n"
+            f"VK ID: {data.get('vk_id', '—') or '—'}\n"
+            f"MAX ID: {data.get('max_id', '—') or '—'}\n"
+            f"Заметки: {data.get('notes', '—') or '—'}"
+        )
+        buttons = [
+            [InlineKeyboardButton("✅ Telegram", callback_data="client_ch:telegram"),
+             InlineKeyboardButton("✅ VK", callback_data="client_ch:vk"),
+             InlineKeyboardButton("✅ MAX", callback_data="client_ch:max")],
+            [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm:create_client"),
+             InlineKeyboardButton("❌ Отмена", callback_data="menu:main")],
+        ]
+        await self._send_or_edit(update, text, InlineKeyboardMarkup(buttons))
+
+    async def _show_client_detail(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, client_id: int) -> int:
+        client = self.db.get_client(client_id)
+        if not client:
+            await self._send_or_edit(update, "Клиент не найден", back_button("menu:clients"))
+            return MAIN_MENU
+        channels = {c["channel"]: c["enabled"] for c in self.db.list_channels(client_id)}
+        tg_status = "✅" if channels.get("telegram") else "❌"
+        vk_status = "✅" if channels.get("vk") else "❌"
+        max_status = "✅" if channels.get("max") else "❌"
+        text = (
+            f"👤 <b>Клиент #{client_id}</b>\n"
+            f"ФИО: {client['full_name']}\n"
+            f"Телефон: {client['phone'] or '—'}\n"
+            f"Telegram ID: {client['telegram_id'] or '—'} {tg_status}\n"
+            f"VK ID: {client['vk_id'] or '—'} {vk_status}\n"
+            f"MAX ID: {client['max_id'] or '—'} {max_status}\n"
+            f"Заметки: {client['notes'] or '—'}"
+        )
+        buttons = [
+            [InlineKeyboardButton("✏️ Редактировать", callback_data=f"client:edit:{client_id}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"client:delete:{client_id}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:clients")],
+        ]
+        await self._send_or_edit(update, text, InlineKeyboardMarkup(buttons))
+        return MAIN_MENU
+
+    async def _start_edit_client(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, client_id: int) -> int:
+        client = self.db.get_client(client_id)
+        if not client:
+            await self._send_or_edit(update, "Клиент не найден", back_button("menu:clients"))
+            return MAIN_MENU
+        ctx.user_data["client_data"] = {"id": client_id, "full_name": client["full_name"],
+                                        "phone": client["phone"] or "",
+                                        "telegram_id": client["telegram_id"] or "",
+                                        "vk_id": client["vk_id"] or "",
+                                        "max_id": client["max_id"] or "",
+                                        "notes": client["notes"] or ""}
+        self._set_conversation_state(ctx, CONFIRMING_CLIENT_UPDATE)
+        buttons = [
+            [InlineKeyboardButton("ФИО", callback_data="edit_field:full_name"),
+             InlineKeyboardButton("Телефон", callback_data="edit_field:phone")],
+            [InlineKeyboardButton("Telegram ID", callback_data="edit_field:telegram_id"),
+             InlineKeyboardButton("VK ID", callback_data="edit_field:vk_id")],
+            [InlineKeyboardButton("MAX ID", callback_data="edit_field:max_id"),
+             InlineKeyboardButton("Заметки", callback_data="edit_field:notes")],
+            [InlineKeyboardButton("✅ Сохранить", callback_data="confirm:update_client"),
+             InlineKeyboardButton("❌ Отмена", callback_data=f"client:view:{client_id}")],
+        ]
+        await self._send_or_edit(update, "✏️ <b>Редактирование клиента</b>\nВыберите поле для изменения:", InlineKeyboardMarkup(buttons))
+        return CONFIRMING_CLIENT_UPDATE
+
+    async def _confirm_delete_client(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, client_id: int) -> int:
+        if self.db.has_orders_for_client(client_id):
+            await self._send_or_edit(update, "❌ Нельзя удалить: у клиента есть заказы", back_button(f"client:view:{client_id}"))
+            return MAIN_MENU
+        self._set_conversation_state(ctx, CONFIRMING_CLIENT_DELETE)
+        ctx.user_data["client_data"] = {"id": client_id}
+        await self._send_or_edit(update, f"❗ Удалить клиента #{client_id}?", confirm_keyboard("confirm:delete_client", f"client:view:{client_id}"))
+        return CONFIRMING_CLIENT_DELETE
+
+    async def _handle_client_channel_toggle(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, channel: str) -> int:
+        data = ctx.user_data.get("client_data", {})
+        client_id = data.get("id")
+        if not client_id:
+            await self._answer_callback(update, "Сначала выберите клиента")
+            return MAIN_MENU
+        channels = {c["channel"]: c["enabled"] for c in self.db.list_channels(client_id)}
+        current = channels.get(channel, False)
+        self.db.set_channel(client_id, channel, not current)
+        await self._answer_callback(update, f"{channel}: {'вкл' if not current else 'выкл'}")
+        return await self._show_client_confirmation(update, ctx)
+
+    async def _handle_client_field_edit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, field: str) -> int:
+        field_names = {
+            "full_name": "ФИО",
+            "phone": "Телефон",
+            "telegram_id": "Telegram ID",
+            "vk_id": "VK ID",
+            "max_id": "MAX ID",
+            "notes": "Заметки",
+        }
+        ctx.user_data["editing_field"] = field
+        self._set_conversation_state(ctx, CONFIRMING_CLIENT_UPDATE)
+        await self._send_or_edit(update, f"✏️ Введите новое значение для <b>{field_names.get(field, field)}</b> (или «пропустить» для очистки):", skip_button())
+        return CONFIRMING_CLIENT_UPDATE
+
+    async def client_field_value_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        field = ctx.user_data.get("editing_field")
+        if not field:
+            return CONFIRMING_CLIENT_UPDATE
+        text = update.message.text.strip()
+        if text.lower() in ("пропустить", "skip", "-"):
+            text = ""
+        ctx.user_data["client_data"][field] = text
+        ctx.user_data.pop("editing_field", None)
+        return await self._start_edit_client(update, ctx, ctx.user_data["client_data"]["id"])
+
+    async def _handle_order_field_edit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, field: str) -> int:
+        field_names = {
+            "description": "Описание",
+            "price": "Цена",
+            "deadline": "Дедлайн",
+        }
+        ctx.user_data["editing_order_field"] = field
+        if field == "description":
+            self._set_conversation_state(ctx, EDITING_ORDER_DESCRIPTION)
+        elif field == "price":
+            self._set_conversation_state(ctx, EDITING_ORDER_PRICE)
+        elif field == "deadline":
+            self._set_conversation_state(ctx, EDITING_ORDER_DEADLINE)
+        await self._send_or_edit(update, f"✏️ Введите новое значение для <b>{field_names.get(field, field)}</b> (или «пропустить» для очистки):", skip_button())
+        return self._get_conversation_state(ctx)
+
+    # ---------- Order Edit/Delete ----------
+
+    async def _start_edit_order(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order:
+            await self._send_or_edit(update, "Заказ не найден", back_button("menu:orders"))
+            return MAIN_MENU
+        ctx.user_data["order_data"] = {"order_id": order_id,
+                                       "description": order["description"] or "",
+                                       "price": str(order["price"] or ""),
+                                       "deadline": order["deadline"] or ""}
+        self._set_conversation_state(ctx, CHOOSING_ORDER_EDIT_FIELD)
+        buttons = [
+            [InlineKeyboardButton("Описание", callback_data="edit_order_field:description"),
+             InlineKeyboardButton("Цена", callback_data="edit_order_field:price")],
+            [InlineKeyboardButton("Дедлайн", callback_data="edit_order_field:deadline")],
+            [InlineKeyboardButton("✅ Сохранить", callback_data="confirm:update_order"),
+             InlineKeyboardButton("❌ Отмена", callback_data=f"order:view:{order_id}")],
+        ]
+        await self._send_or_edit(update, "✏️ <b>Редактирование заказа</b>\nВыберите поле:", InlineKeyboardMarkup(buttons))
+        return CHOOSING_ORDER_EDIT_FIELD
+
+    async def _confirm_delete_order(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order:
+            await self._send_or_edit(update, "Заказ не найден", back_button("menu:orders"))
+            return MAIN_MENU
+        self._set_conversation_state(ctx, CONFIRMING_ORDER_DELETE)
+        ctx.user_data["order_data"] = {"order_id": order_id}
+        await self._send_or_edit(update, f"❗ Удалить заказ #{order_id} ({order['client_name']})?", confirm_keyboard("confirm:delete_order", f"order:view:{order_id}"))
+        return CONFIRMING_ORDER_DELETE
+
+    # ---------- Text handlers for order edit ----------
+
+    async def edit_order_description_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["order_data"]["description"] = text
+        self._set_conversation_state(ctx, CHOOSING_ORDER_EDIT_FIELD)
+        await update.message.reply_text("✅ Описание обновлено. Выберите следующее поле или сохраните.", reply_markup=back_button("menu:main"))
+        return CHOOSING_ORDER_EDIT_FIELD
+
+    async def edit_order_price_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        if text and not text.replace(".", "").isdigit():
+            await update.message.reply_text("Введите число или оставьте пустым:", reply_markup=skip_button())
+            return EDITING_ORDER_PRICE
+        ctx.user_data["order_data"]["price"] = text
+        self._set_conversation_state(ctx, CHOOSING_ORDER_EDIT_FIELD)
+        await update.message.reply_text("✅ Цена обновлена. Выберите следующее поле или сохраните.", reply_markup=back_button("menu:main"))
+        return CHOOSING_ORDER_EDIT_FIELD
+
+    async def edit_order_deadline_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        ctx.user_data["order_data"]["deadline"] = text
+        self._set_conversation_state(ctx, CHOOSING_ORDER_EDIT_FIELD)
+        await update.message.reply_text("✅ Дедлайн обновлён. Выберите следующее поле или сохраните.", reply_markup=back_button("menu:main"))
+        return CHOOSING_ORDER_EDIT_FIELD
+
+    # ---------- Confirmation handlers for client/order actions ----------
+
+    async def _handle_client_confirmation(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str) -> int:
+        if action == "create_client":
+            data = ctx.user_data.get("client_data", {})
+            client_id = self.db.add_client(
+                full_name=data.get("full_name", ""),
+                phone=data.get("phone", ""),
+                telegram_id=data.get("telegram_id", ""),
+                vk_id=data.get("vk_id", ""),
+                max_id=data.get("max_id", ""),
+                notes=data.get("notes", "")
+            )
+            ctx.user_data.clear()
+            await self._send_or_edit(update, f"✅ Клиент #{client_id} создан!", InlineKeyboardMarkup([[InlineKeyboardButton("👥 К клиентам", callback_data="menu:clients")]]))
+            return MAIN_MENU
+        elif action == "update_client":
+            data = ctx.user_data.get("client_data", {})
+            client_id = data.get("id")
+            if client_id:
+                self.db.update_client(client_id, **{k: v for k, v in data.items() if k != "id"})
+            ctx.user_data.clear()
+            await self._send_or_edit(update, f"✅ Клиент #{client_id} обновлён!", InlineKeyboardMarkup([[InlineKeyboardButton("👥 К клиентам", callback_data="menu:clients")]]))
+            return MAIN_MENU
+        elif action == "delete_client":
+            data = ctx.user_data.get("client_data", {})
+            client_id = data.get("id")
+            if client_id:
+                self.db.delete_client(client_id)
+            ctx.user_data.clear()
+            await self._send_or_edit(update, f"✅ Клиент #{client_id} удалён.", InlineKeyboardMarkup([[InlineKeyboardButton("👥 К клиентам", callback_data="menu:clients")]]))
+            return MAIN_MENU
+        return MAIN_MENU
+
+    async def _handle_order_confirmation(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str) -> int:
+        if action == "update_order":
+            data = ctx.user_data.get("order_data", {})
+            order_id = data.get("order_id")
+            if order_id:
+                self.db.update_order(order_id,
+                                     description=data.get("description") or None,
+                                     price=float(data["price"]) if data.get("price") else None,
+                                     deadline=data.get("deadline") or None)
+            ctx.user_data.clear()
+            await self._send_or_edit(update, f"✅ Заказ #{order_id} обновлён!", InlineKeyboardMarkup([[InlineKeyboardButton("📋 К заказам", callback_data="menu:orders")]]))
+            return MAIN_MENU
+        elif action == "delete_order":
+            data = ctx.user_data.get("order_data", {})
+            order_id = data.get("order_id")
+            if order_id:
+                self.db.delete_order(order_id)
+            ctx.user_data.clear()
+            await self._send_or_edit(update, f"✅ Заказ #{order_id} удалён.", InlineKeyboardMarkup([[InlineKeyboardButton("📋 К заказам", callback_data="menu:orders")]]))
+            return MAIN_MENU
+        return MAIN_MENU
+
     def _get_conversation_state(self, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         # ConversationHandler stores state in a special key, but we can track it ourselves
         return ctx.user_data.get("_conversation_state", MAIN_MENU)
@@ -674,6 +1021,27 @@ class TgBot:
                     CallbackQueryHandler(self.callback_handler),
                 ],
                 CONFIRMING_STATUS: [CallbackQueryHandler(self.callback_handler)],
+                # Client CRUD
+                CHOOSING_CLIENT_ACTION: [CallbackQueryHandler(self.callback_handler)],
+                ENTERING_CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_name_handler)],
+                ENTERING_CLIENT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_phone_handler)],
+                ENTERING_CLIENT_TG_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_tg_id_handler)],
+                ENTERING_CLIENT_VK_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_vk_id_handler)],
+                ENTERING_CLIENT_MAX_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_max_id_handler)],
+                ENTERING_CLIENT_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_notes_handler)],
+                CONFIRMING_CLIENT_CREATE: [CallbackQueryHandler(self.callback_handler)],
+                CONFIRMING_CLIENT_UPDATE: [
+                    CallbackQueryHandler(self.callback_handler),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.client_field_value_handler),
+                ],
+                CONFIRMING_CLIENT_DELETE: [CallbackQueryHandler(self.callback_handler)],
+                # Order edit
+                CHOOSING_ORDER_EDIT_FIELD: [CallbackQueryHandler(self.callback_handler)],
+                EDITING_ORDER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_order_description_handler)],
+                EDITING_ORDER_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_order_price_handler)],
+                EDITING_ORDER_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_order_deadline_handler)],
+                CONFIRMING_ORDER_EDIT: [CallbackQueryHandler(self.callback_handler)],
+                CONFIRMING_ORDER_DELETE: [CallbackQueryHandler(self.callback_handler)],
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
             per_message=False,

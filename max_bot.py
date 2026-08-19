@@ -38,6 +38,24 @@ class State(Enum):
     CONFIRMING_STATUS_CHANGE = "confirming_status_change"
     # View order
     VIEWING_ORDER = "viewing_order"
+    # Client management
+    CHOOSING_CLIENT_ACTION = "choosing_client_action"
+    ENTERING_CLIENT_NAME = "entering_client_name"
+    ENTERING_CLIENT_PHONE = "entering_client_phone"
+    ENTERING_CLIENT_TG_ID = "entering_client_tg_id"
+    ENTERING_CLIENT_VK_ID = "entering_client_vk_id"
+    ENTERING_CLIENT_MAX_ID = "entering_client_max_id"
+    ENTERING_CLIENT_NOTES = "entering_client_notes"
+    CONFIRMING_CLIENT_CREATE = "confirming_client_create"
+    CONFIRMING_CLIENT_UPDATE = "confirming_client_update"
+    CONFIRMING_CLIENT_DELETE = "confirming_client_delete"
+    # Order edit
+    CHOOSING_ORDER_EDIT_FIELD = "choosing_order_edit_field"
+    EDITING_ORDER_DESCRIPTION = "editing_order_description"
+    EDITING_ORDER_PRICE = "editing_order_price"
+    EDITING_ORDER_DEADLINE = "editing_order_deadline"
+    CONFIRMING_ORDER_EDIT = "confirming_order_edit"
+    CONFIRMING_ORDER_DELETE = "confirming_order_delete"
 
 # ---------- Keyboards ----------
 
@@ -63,6 +81,10 @@ def confirm_keyboard(confirm_payload: str, cancel_payload: str = "menu:main") ->
         [{"type": "callback", "text": "✅ Подтвердить", "payload": confirm_payload}],
         [{"type": "callback", "text": "❌ Отмена", "payload": cancel_payload}],
     ]
+
+
+def cancel_button() -> list:
+    return [[{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]]
 
 
 class MaxBot:
@@ -287,6 +309,24 @@ class MaxBot:
         # Handle text input based on state
         if state == State.ENTERING_DESCRIPTION:
             self._handle_description(user_id, text)
+        elif state == State.ENTERING_CLIENT_NAME:
+            self._handle_client_name(user_id, text)
+        elif state == State.ENTERING_CLIENT_PHONE:
+            self._handle_client_phone(user_id, text)
+        elif state == State.ENTERING_CLIENT_TG_ID:
+            self._handle_client_tg_id(user_id, text)
+        elif state == State.ENTERING_CLIENT_VK_ID:
+            self._handle_client_vk_id(user_id, text)
+        elif state == State.ENTERING_CLIENT_MAX_ID:
+            self._handle_client_max_id(user_id, text)
+        elif state == State.ENTERING_CLIENT_NOTES:
+            self._handle_client_notes(user_id, text)
+        elif state == State.EDITING_ORDER_DESCRIPTION:
+            self._handle_edit_description(user_id, text)
+        elif state == State.EDITING_ORDER_PRICE:
+            self._handle_edit_price(user_id, text)
+        elif state == State.EDITING_ORDER_DEADLINE:
+            self._handle_edit_deadline(user_id, text)
         elif state == State.MAIN_MENU:
             # Ignore random text in main menu, show help
             self._show_main_menu(user_id)
@@ -321,6 +361,12 @@ class MaxBot:
                 self._handle_skip_photo(user_id, callback_id)
             elif action == "confirm":
                 self._handle_confirm(user_id, callback_id, parts[1] if len(parts) > 1 else "")
+            elif action == "client_ch":
+                self._handle_client_channel_toggle(user_id, callback_id, parts[1] if len(parts) > 1 else "")
+            elif action == "client_ch_edit":
+                self._handle_client_channel_edit_toggle(user_id, callback_id, parts[1] if len(parts) > 1 else "")
+            elif action == "edit_field":
+                self._handle_edit_field(user_id, callback_id, parts[1] if len(parts) > 1 else "")
             elif action == "cancel":
                 self._handle_cancel(user_id, callback_id)
         except Exception as exc:
@@ -360,18 +406,27 @@ class MaxBot:
         self._set_state(user_id, State.CHOOSING_CLIENT, {})
         self.answer_callback(callback_id, "👤 <b>Шаг 1/4: Выберите клиента</b>", buttons)
 
-    def _handle_client_callback(self, user_id: str, callback_id: str, client_id_str: str) -> None:
-        if not client_id_str.isdigit():
-            self.answer_callback(callback_id, "Неверный клиент")
-            return
-        client_id = int(client_id_str)
-        client = self.db.get_client(client_id)
-        if not client:
-            self.answer_callback(callback_id, "Клиент не найден")
-            return
-
-        self._update_data(user_id, client_id=client_id, client_name=client["full_name"])
-        self._show_services_for_order(user_id, callback_id)
+    def _handle_client_callback(self, user_id: str, callback_id: str, sub_action: str) -> None:
+        if sub_action == "create":
+            self._start_create_client(user_id, callback_id)
+        elif sub_action == "view":
+            # This shouldn't happen directly, view requires client_id
+            self._show_clients_list(user_id, callback_id)
+        elif sub_action == "edit" or sub_action == "delete":
+            # These need client_id, handled by _on_callback with full payload
+            pass
+        else:
+            # Legacy: selecting client for new order
+            if sub_action.isdigit():
+                client_id = int(sub_action)
+                client = self.db.get_client(client_id)
+                if not client:
+                    self.answer_callback(callback_id, "Клиент не найден")
+                    return
+                self._update_data(user_id, client_id=client_id, client_name=client["full_name"])
+                self._show_services_for_order(user_id, callback_id)
+            else:
+                self.answer_callback(callback_id, "Неизвестное действие с клиентом")
 
     def _show_services_for_order(self, user_id: str, callback_id: str) -> None:
         services = self.db.list_services()
@@ -524,16 +579,23 @@ class MaxBot:
         else:
             self.send_message(user_id, text, buttons)
 
-    def _handle_order_callback(self, user_id: str, callback_id: str, order_id_str: str) -> None:
-        if not order_id_str.isdigit():
-            self.answer_callback(callback_id, "Неверный заказ")
-            return
-        order = self.db.get_order(int(order_id_str))
-        if not order:
-            self.answer_callback(callback_id, "Заказ не найден")
-            return
-
-        self._show_order_detail(user_id, callback_id, order)
+    def _handle_order_callback(self, user_id: str, callback_id: str, sub_action: str) -> None:
+        parts = sub_action.split(":")
+        action = parts[0] if parts else ""
+        
+        if action == "edit" and len(parts) > 1:
+            self._start_edit_order(user_id, callback_id, int(parts[1]))
+        elif action == "delete" and len(parts) > 1:
+            self._confirm_delete_order(user_id, callback_id, int(parts[1]))
+        elif action.isdigit():
+            # Legacy: view order by ID
+            order = self.db.get_order(int(action))
+            if not order:
+                self.answer_callback(callback_id, "Заказ не найден")
+                return
+            self._show_order_detail(user_id, callback_id, order)
+        else:
+            self.answer_callback(callback_id, "Неизвестное действие с заказом")
 
     def _show_order_detail(self, user_id: str, callback_id: str | None, order) -> None:
         photos = self.db.get_order_photos(order["id"])
@@ -557,6 +619,8 @@ class MaxBot:
             [{"type": "callback", "text": "🔄 Сменить статус", "payload": f"status:change:{order['id']}"}],
             [{"type": "callback", "text": "📸 История фото", "payload": f"status:photos:{order['id']}"}],
             [{"type": "callback", "text": "➕ Доп. услуги", "payload": f"status:extra:{order['id']}"}],
+            [{"type": "callback", "text": "✏️ Редактировать", "payload": f"order:edit:{order['id']}"}],
+            [{"type": "callback", "text": "🗑 Удалить", "payload": f"order:delete:{order['id']}"}],
             [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:orders"}],
         ]
 
@@ -701,12 +765,17 @@ class MaxBot:
         clients = self.db.list_clients()
         if not clients:
             text = "👥 Клиентов пока нет."
-            buttons = back_button()
+            buttons = [[{"type": "callback", "text": "➕ Создать клиента", "payload": "client:create"}],
+                       [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}]]
         else:
             text = "👥 <b>Клиенты</b> (первые 20):"
-            buttons = []
+            buttons = [[{"type": "callback", "text": "➕ Создать клиента", "payload": "client:create"}]]
             for c in clients[:20]:
-                buttons.append([{"type": "callback", "text": f"#{c['id']} {c['full_name']} ({c['phone'] or '—'})", "payload": f"client:view:{c['id']}"}])
+                buttons.append([{"type": "callback", "text": f"👁 {c['full_name']} ({c['phone'] or '—'})", "payload": f"client:view:{c['id']}"}])
+                if not self.db.has_orders_for_client(c['id']):
+                    buttons.append([{"type": "callback", "text": "🗑 Удалить", "payload": f"client:delete:{c['id']}"}])
+                else:
+                    buttons.append([{"type": "callback", "text": "✏️ Редактировать", "payload": f"client:edit:{c['id']}"}])
             buttons.append([{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}])
 
         if callback_id:
@@ -745,6 +814,317 @@ class MaxBot:
     def _handle_cancel(self, user_id: str, callback_id: str) -> None:
         self._clear_state(user_id)
         self.answer_callback(callback_id, "❌ Отменено", main_menu_keyboard())
+
+    # ---------- Client Management ----------
+
+    def _start_create_client(self, user_id: str, callback_id: str) -> None:
+        self._set_state(user_id, State.ENTERING_CLIENT_NAME, {})
+        self.answer_callback(callback_id, "👤 <b>Создание клиента</b>\nВведите ФИО (обязательно):", cancel_button())
+
+    def _handle_client_name(self, user_id: str, text: str) -> None:
+        text = text.strip()
+        if not text:
+            self.send_message(user_id, "ФИО не может быть пустым. Введите снова:", cancel_button())
+            return
+        self._update_data(user_id, full_name=text)
+        self._set_state(user_id, State.ENTERING_CLIENT_PHONE)
+        self.send_message(user_id, "📞 Телефон (или «пропустить»):", cancel_button())
+
+    def _handle_client_phone(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, phone="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
+        self._set_state(user_id, State.ENTERING_CLIENT_TG_ID)
+        self.send_message(user_id, "🤖 Telegram ID (или «пропустить»):", cancel_button())
+
+    def _handle_client_tg_id(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, telegram_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
+        self._set_state(user_id, State.ENTERING_CLIENT_VK_ID)
+        self.send_message(user_id, "🔵 VK ID (или «пропустить»):", cancel_button())
+
+    def _handle_client_vk_id(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, vk_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
+        self._set_state(user_id, State.ENTERING_CLIENT_MAX_ID)
+        self.send_message(user_id, "🟣 MAX ID (или «пропустить»):", cancel_button())
+
+    def _handle_client_max_id(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, max_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
+        self._set_state(user_id, State.ENTERING_CLIENT_NOTES)
+        self.send_message(user_id, "📝 Заметки (или «пропустить»):", cancel_button())
+
+    def _handle_client_notes(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, notes="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
+        self._set_state(user_id, State.CONFIRMING_CLIENT_CREATE)
+        self._show_client_confirmation(user_id, None)
+
+    def _show_client_confirmation(self, user_id: str, callback_id: str | None) -> None:
+        data = self._get_data(user_id)
+        ch_tg = "✅" if data.get("ch_telegram") else "☐"
+        ch_vk = "✅" if data.get("ch_vk") else "☐"
+        ch_max = "✅" if data.get("ch_max") else "☐"
+        text = (
+            f"✅ <b>Подтвердите создание клиента</b>\n\n"
+            f"ФИО: {data.get('full_name', '—')}\n"
+            f"Телефон: {data.get('phone', '—') or '—'}\n"
+            f"Telegram ID: {data.get('telegram_id', '—') or '—'}\n"
+            f"VK ID: {data.get('vk_id', '—') or '—'}\n"
+            f"MAX ID: {data.get('max_id', '—') or '—'}\n"
+            f"Заметки: {data.get('notes', '—') or '—'}\n\n"
+            f"Каналы уведомлений:\n"
+            f"  {ch_tg} Telegram\n"
+            f"  {ch_vk} VK\n"
+            f"  {ch_max} MAX"
+        )
+        buttons = [
+            [{"type": "callback", "text": f"{ch_tg} Telegram", "payload": "client_ch:telegram"},
+             {"type": "callback", "text": f"{ch_vk} VK", "payload": "client_ch:vk"},
+             {"type": "callback", "text": f"{ch_max} MAX", "payload": "client_ch:max"}],
+            [{"type": "callback", "text": "✅ Подтвердить", "payload": "confirm:create_client"},
+             {"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}],
+        ]
+        if callback_id:
+            self.answer_callback(callback_id, text, buttons)
+        else:
+            self.send_message(user_id, text, buttons)
+
+    def _handle_client_channel_toggle(self, user_id: str, callback_id: str, channel: str) -> None:
+        data = self._get_data(user_id)
+        key = f"ch_{channel}"
+        data[key] = not data.get(key, False)
+        self._update_data(user_id, **{key: data[key]})
+        self._show_client_confirmation(user_id, callback_id)
+
+    def _confirm_create_client(self, user_id: str, callback_id: str) -> None:
+        data = self._get_data(user_id)
+        if "full_name" not in data:
+            self.answer_callback(callback_id, "❌ Не хватает данных")
+            return
+        client_id = self.db.add_client(
+            full_name=data["full_name"],
+            phone=data.get("phone", ""),
+            telegram_id=data.get("telegram_id", ""),
+            vk_id=data.get("vk_id", ""),
+            max_id=data.get("max_id", ""),
+            notes=data.get("notes", ""),
+        )
+        for ch in ("telegram", "vk", "max"):
+            if data.get(f"ch_{ch}"):
+                self.db.set_channel(client_id, ch, True)
+        self._clear_state(user_id)
+        self.answer_callback(callback_id,
+            f"✅ <b>Клиент #{client_id} создан!</b>\nФИО: {data['full_name']}",
+            [[{"type": "callback", "text": "👥 К клиентам", "payload": "menu:clients"}]])
+
+    def _show_client_detail(self, user_id: str, callback_id: str, client_id: int) -> None:
+        client = self.db.get_client(client_id)
+        if not client:
+            self.answer_callback(callback_id, "Клиент не найден", back_button("menu:clients"))
+            return
+        text = (
+            f"👤 <b>Клиент #{client_id}</b>\n"
+            f"ФИО: {client['full_name']}\n"
+            f"Телефон: {client['phone'] or '—'}\n"
+            f"TG ID: {client['telegram_id'] or '—'}\n"
+            f"VK ID: {client['vk_id'] or '—'}\n"
+            f"MAX ID: {client['max_id'] or '—'}\n"
+            f"Заметки: {client['notes'] or '—'}"
+        )
+        buttons = [
+            [{"type": "callback", "text": "✏️ Редактировать", "payload": f"client:edit:{client_id}"}],
+            [{"type": "callback", "text": "🗑 Удалить", "payload": f"client:delete:{client_id}"}],
+            [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:clients"}],
+        ]
+        self.answer_callback(callback_id, text, buttons)
+
+    def _start_edit_client(self, user_id: str, callback_id: str, client_id: int) -> None:
+        client = self.db.get_client(client_id)
+        if not client:
+            self.answer_callback(callback_id, "Клиент не найден")
+            return
+        self._update_data(user_id, client_id=client_id)
+        self._set_state(user_id, State.CHOOSING_ORDER_EDIT_FIELD)
+        buttons = [
+            [{"type": "callback", "text": "ФИО", "payload": "edit_field:full_name"},
+             {"type": "callback", "text": "Телефон", "payload": "edit_field:phone"},
+             {"type": "callback", "text": "TG ID", "payload": "edit_field:telegram_id"}],
+            [{"type": "callback", "text": "VK ID", "payload": "edit_field:vk_id"},
+             {"type": "callback", "text": "MAX ID", "payload": "edit_field:max_id"},
+             {"type": "callback", "text": "Заметки", "payload": "edit_field:notes"}],
+            [{"type": "callback", "text": "Каналы уведомлений", "payload": "edit_field:channels"},
+             {"type": "callback", "text": "❌ Отмена", "payload": f"client:view:{client_id}"}],
+        ]
+        self.answer_callback(callback_id, "✏️ Что редактировать?", buttons)
+
+    def _show_client_channels_edit(self, user_id: str, callback_id: str) -> None:
+        data = self._get_data(user_id)
+        client_id = data.get("client_id")
+        client = self.db.get_client(client_id) if client_id else None
+        ch_tg = "✅" if client and client.get("notify_telegram") else "☐"
+        ch_vk = "✅" if client and client.get("notify_vk") else "☐"
+        ch_max = "✅" if client and client.get("notify_max") else "☐"
+        text = "🔔 <b>Каналы уведомлений клиента</b>\nНажмите для переключения:"
+        buttons = [
+            [{"type": "callback", "text": f"{ch_tg} Telegram", "payload": "client_ch_edit:telegram"},
+             {"type": "callback", "text": f"{ch_vk} VK", "payload": "client_ch_edit:vk"},
+             {"type": "callback", "text": f"{ch_max} MAX", "payload": "client_ch_edit:max"}],
+            [{"type": "callback", "text": "⬅️ Назад", "payload": f"client:edit:{client_id}"}],
+        ]
+        self.answer_callback(callback_id, text, buttons)
+
+    def _handle_client_channel_edit_toggle(self, user_id: str, callback_id: str, channel: str) -> None:
+        data = self._get_data(user_id)
+        client_id = data.get("client_id")
+        if not client_id:
+            self.answer_callback(callback_id, "Ошибка: клиент не найден")
+            return
+        client = self.db.get_client(client_id)
+        if not client:
+            self.answer_callback(callback_id, "Клиент не найден")
+            return
+        
+        current = client.get(f"notify_{channel}", False)
+        new_value = not current
+        self.db.set_channel(client_id, channel, new_value)
+        
+        # Refresh the view
+        self._show_client_channels_edit(user_id, callback_id)
+
+    def _confirm_delete_client(self, user_id: str, callback_id: str, client_id: int) -> None:
+        if self.db.has_orders_for_client(client_id):
+            self.answer_callback(callback_id, "❌ Нельзя удалить: у клиента есть заказы",
+                                 [[{"type": "callback", "text": "⬅️ Назад", "payload": f"client:view:{client_id}"}]])
+            return
+        self._update_data(user_id, client_id=client_id)
+        self._set_state(user_id, State.CONFIRMING_CLIENT_DELETE)
+        self.answer_callback(callback_id,
+            f"❗ Удалить клиента #{client_id}?",
+            confirm_keyboard("confirm:delete_client", f"client:view:{client_id}"))
+
+    def _execute_delete_client(self, user_id: str, callback_id: str) -> None:
+        data = self._get_data(user_id)
+        client_id = data.get("client_id")
+        if client_id:
+            self.db.delete_client(client_id)
+        self._clear_state(user_id)
+        self.answer_callback(callback_id, "✅ Клиент удалён",
+                             [[{"type": "callback", "text": "👥 К клиентам", "payload": "menu:clients"}]])
+
+    # ---------- Order Edit & Delete ----------
+
+    def _start_edit_order(self, user_id: str, callback_id: str, order_id: int) -> None:
+        order = self.db.get_order(order_id)
+        if not order:
+            self.answer_callback(callback_id, "Заказ не найден")
+            return
+        self._update_data(user_id, order_id=order_id)
+        self._set_state(user_id, State.CHOOSING_ORDER_EDIT_FIELD)
+        buttons = [
+            [{"type": "callback", "text": "Описание", "payload": "edit_field:description"},
+             {"type": "callback", "text": "Цена", "payload": "edit_field:price"},
+             {"type": "callback", "text": "Дедлайн", "payload": "edit_field:deadline"}],
+            [{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}],
+        ]
+        self.answer_callback(callback_id, f"✏️ Что редактировать в заказе #{order_id}?", buttons)
+
+    def _handle_edit_description(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, edit_value=text.strip())
+        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
+        self.send_message(user_id,
+            f"Изменить описание на: {text.strip()}?",
+            confirm_keyboard("confirm:edit_order", "menu:orders"))
+
+    def _handle_edit_price(self, user_id: str, text: str) -> None:
+        try:
+            price = float(text.strip()) if text.strip() else None
+        except ValueError:
+            self.send_message(user_id, "Некорректная цена. Введите число:", cancel_button())
+            return
+        self._update_data(user_id, edit_value=price)
+        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
+        self.send_message(user_id,
+            f"Изменить цену на: {price}?",
+            confirm_keyboard("confirm:edit_order", "menu:orders"))
+
+    def _handle_edit_deadline(self, user_id: str, text: str) -> None:
+        self._update_data(user_id, edit_value=text.strip())
+        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
+        self.send_message(user_id,
+            f"Изменить дедлайн на: {text.strip()}?",
+            confirm_keyboard("confirm:edit_order", "menu:orders"))
+
+    def _confirm_edit_order(self, user_id: str, callback_id: str) -> None:
+        data = self._get_data(user_id)
+        order_id = data.get("order_id")
+        field = data.get("edit_field")
+        value = data.get("edit_value")
+        if order_id and field and value is not None:
+            self.db.update_order(order_id, **{field: value})
+        self._clear_state(user_id)
+        self.answer_callback(callback_id, "✅ Заказ обновлён",
+                             [[{"type": "callback", "text": "📦 К заказу", "payload": f"order:{order_id}"}]])
+
+    def _confirm_delete_order(self, user_id: str, callback_id: str, order_id: int) -> None:
+        self._update_data(user_id, order_id=order_id)
+        self._set_state(user_id, State.CONFIRMING_ORDER_DELETE)
+        self.answer_callback(callback_id,
+            f"❗ Удалить заказ #{order_id}?",
+            confirm_keyboard("confirm:delete_order", f"order:{order_id}"))
+
+    def _execute_delete_order(self, user_id: str, callback_id: str) -> None:
+        data = self._get_data(user_id)
+        order_id = data.get("order_id")
+        if order_id:
+            self.db.delete_order(order_id)
+        self._clear_state(user_id)
+        self.answer_callback(callback_id, "✅ Заказ удалён",
+                             [[{"type": "callback", "text": "📋 К заказам", "payload": "menu:orders"}]])
+
+    # ---------- Handle Confirm & Edit Field ----------
+
+    def _handle_confirm(self, user_id: str, callback_id: str, action: str) -> None:
+        if action == "create_order":
+            self._create_order(user_id, callback_id)
+        elif action == "change_status":
+            self._execute_status_change(user_id, callback_id)
+        elif action == "create_client":
+            self._confirm_create_client(user_id, callback_id)
+        elif action == "delete_client":
+            self._execute_delete_client(user_id, callback_id)
+        elif action == "edit_order":
+            self._confirm_edit_order(user_id, callback_id)
+        elif action == "delete_order":
+            self._execute_delete_order(user_id, callback_id)
+        else:
+            self.answer_callback(callback_id, "Неизвестное подтверждение")
+
+    def _handle_edit_field(self, user_id: str, callback_id: str, field: str) -> None:
+        data = self._get_data(user_id)
+        client_id = data.get("client_id")
+        order_id = data.get("order_id")
+
+        if field in ("full_name", "phone", "telegram_id", "vk_id", "max_id", "notes"):
+            self._update_data(user_id, edit_field=field)
+            state_map = {
+                "full_name": State.ENTERING_CLIENT_NAME,
+                "phone": State.ENTERING_CLIENT_PHONE,
+                "telegram_id": State.ENTERING_CLIENT_TG_ID,
+                "vk_id": State.ENTERING_CLIENT_VK_ID,
+                "max_id": State.ENTERING_CLIENT_MAX_ID,
+                "notes": State.ENTERING_CLIENT_NOTES,
+            }
+            self._set_state(user_id, state_map[field])
+            self.answer_callback(callback_id, f"Введите новое значение для {field} (или «пропустить»):", cancel_button())
+        elif field == "channels":
+            self._show_client_channels_edit(user_id, callback_id)
+        elif field in ("description", "price", "deadline"):
+            self._update_data(user_id, edit_field=field)
+            state_map = {
+                "description": State.EDITING_ORDER_DESCRIPTION,
+                "price": State.EDITING_ORDER_PRICE,
+                "deadline": State.EDITING_ORDER_DEADLINE,
+            }
+            self._set_state(user_id, state_map[field])
+            self.answer_callback(callback_id, f"Введите новое значение для {field}:", cancel_button())
+        else:
+            self.answer_callback(callback_id, "Неизвестное поле")
 
     # ---------- Run ----------
 

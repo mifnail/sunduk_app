@@ -5,11 +5,13 @@
 
 {% if not order %}
 <form method="post" action="{{ url_for('order_create') }}" class="card form" enctype="multipart/form-data">
+{% elif edit_mode %}
+<form method="post" action="{{ url_for('order_update', oid=order.id) }}" class="card form" enctype="multipart/form-data">
 {% else %}
 <form method="post" action="{{ url_for('order_set_status', oid=order.id) }}" class="card form" enctype="multipart/form-data">
 {% endif %}
 
-  {% if order %}
+  {% if order and not edit_mode %}
   <div class="order-header">
     <p><strong>Клиент:</strong> {{ order.client_name }} ({{ order.phone or 'нет телефона' }})</p>
     <p><strong>Услуга:</strong> {{ order.service_name }}</p>
@@ -96,6 +98,29 @@
     </div>
   </div>
 
+  {% elif edit_mode %}
+  <!-- Редактирование заказа -->
+  <div class="order-header">
+    <p><strong>Клиент:</strong> {{ order.client_name }} ({{ order.phone or 'нет телефона' }})</p>
+    <p><strong>Услуга:</strong> {{ order.service_name }}</p>
+    <p><strong>Статус:</strong> <span class="badge">{{ order.status_name }}</span></p>
+  </div>
+
+  <label>Описание</label>
+  <textarea name="description">{{ order.description or '' }}</textarea>
+
+  <label>Файл модели (STL)</label>
+  <input type="text" name="model_file" value="{{ order.model_file or '' }}">
+
+  <label>Цена</label>
+  <input type="number" step="0.01" name="price" value="{{ order.price or '' }}">
+
+  <label>Срок</label>
+  <input type="date" name="deadline" value="{{ order.deadline or '' }}">
+
+  <button type="submit">Сохранить изменения</button>
+  <a href="{{ url_for('order_detail', oid=order.id) }}" class="button secondary">Отмена</a>
+
   {% else %}
   <!-- Создание нового заказа -->
   <div class="row">
@@ -137,7 +162,7 @@
   {% endif %}
 </form>
 
-{% if order %}
+{% if order and not edit_mode %}
 <h3>История статусов</h3>
 <table>
   <thead><tr><th>Дата</th><th>Статус</th></tr></thead>
@@ -151,5 +176,7 @@
 <form method="post" action="{{ url_for('order_delete', oid=order.id) }}" class="inline">
   <button class="danger" onclick="return confirm('Удалить заказ?')">Удалить заказ</button>
 </form>
+
+<a href="{{ url_for('order_edit', oid=order.id) }}" class="button">✏️ Редактировать заказ</a>
 {% endif %}
 {% endblock %}
