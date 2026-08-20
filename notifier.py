@@ -1,274 +1,248 @@
-import logging
+"""Уведомления клиентов: протокол Notifier + 3 реализации + отправка.
+
+Каналы: Telegram, VK, MAX. Каждый нотификатор независим —
+ошибка одного канала не влияет на остальные (см. send_notifications).
+
+ВАЖНО: это уведомления КЛИЕНТАМ. Бот оператора в MAX — это max_bot.py
+(класс MaxBot), его не следует путать с MaxNotifier.
+"""
+
 import os
-from typing import Any, Callable, Protocol, runtime_checkable
+import random
+from typing import Protocol, runtime_checkable
 
 import requests
-
-log = logging.getLogger("notifier")
 
 
 @runtime_checkable
 class Notifier(Protocol):
+    """Протокол канала уведомлений."""
+
     name: str
 
     def send(self, recipient_id: str, message: str) -> bool: ...
-    def send_photo(self, recipient_id: str, photo_data: bytes, caption: str = "",
-                   mime_type: str = "image/jpeg") -> bool: ...
+
+    def send_photo(self, recipient_id: str, photo_data: bytes,
+                   caption: str = "", mime_type: str = "image/jpeg") -> bool: ...
 
 
 class TelegramNotifier:
+    """Уведомления через Telegram Bot API (опционально через SOCKS5-прокси)."""
+
     name = "telegram"
+    API_BASE = "https://api.telegram.org"
 
-    def __init__(self, token: str = "", base_url: str = "https://api.telegram.org"):
-        self.token = token or os.environ.get("TG_TOKEN", "")
-        self.base_url = base_url
-        self.proxy = os.environ.get("TG_PROXY", "")
+    def __init__(self, token: str | None = None, proxy: str | None = None) -> None:
+        self.token = token or os.environ.get("TG_TOKEN")
+        if not self.token:
+            raise ValueError("TelegramNotifier: TG_TOKEN не задан")
+        self.proxy = proxy or os.environ.get("TG_PROXY")
+        self._proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
 
-    def _session(self) -> requests.Session:
-        s = requests.Session()
-        if self.proxy:
-            s.proxies = {"http": self.proxy, "https": self.proxy}
-        return s
+    def _url(self, method: str) -> str:
+        return f"{self.API_BASE}/bot{self.token}/{method}"
 
     def send(self, recipient_id: str, message: str) -> bool:
-        if not self.token or not recipient_id:
-            return False
-        url = f"{self.base_url}/bot{self.token}/sendMessage"
-        session = self._session()
-        resp = session.post(url, json={
-            "chat_id": recipient_id,
-            "text": message,
-            "disable_web_page_preview": True,
-        }, timeout=10)
+        resp = requests.post(
+            self._url("sendMessage"),
+            data={"chat_id": recipient_id, "text": message},
+            proxies=self._proxies,
+            timeout=15,
+        )
         resp.raise_for_status()
-        return resp.json().get("ok", False)
+        return bool(resp.json().get("ok", False))
 
-    def send_photo(self, recipient_id: str, photo_data: bytes, caption: str = "",
-                   mime_type: str = "image/jpeg") -> bool:
-        if not self.token or not recipient_id:
-            return False
-        url = f"{self.base_url}/bot{self.token}/sendPhoto"
-        session = self._session()
-        files = {"photo": ("photo.jpg", photo_data, mime_type)}
-        data = {"chat_id": recipient_id}
-        if caption:
-            data["caption"] = caption
-        resp = session.post(url, data=data, files=files, timeout=20)
+    def send_photo(self, recipient_id: str, photo_data: bytes,
+                   caption: str = "", mime_type: str = "image/jpeg") -> bool:
+        resp = requests.post(
+            self._url("sendPhoto"),
+            data={"chat_id": recipient_id, "caption": caption},
+            files={"photo": ("photo.jpg", photo_data, mime_type)},
+            proxies=self._proxies,
+            timeout=30,
+        )
         resp.raise_for_status()
-        return resp.json().get("ok", False)
+        return bool(resp.json().get("ok", False))
 
 
 class VKNotifier:
+    """Уведомления через VK Bot API (сообщения сообщества).
+
+    Фото отправляется в 4 шага: получить URL загрузки →
+    загрузить файл → сохранить фото → отправить сообщение с вложением.
+    """
+
     name = "vk"
+    API_URL = "https://api.vk.com/method"
 
-    def __init__(self, token: str = "", group_id: str = "",
-                 api_url: str = "https://api.vk.com/method"):
-        self.token = token or os.environ.get("VK_TOKEN", "")
-        self.group_id = group_id or os.environ.get("VK_GROUP_ID", "")
-        self.api_url = api_url
-        self.version = os.environ.get("VK_API_VERSION", "5.199")
+    def __init__(self, token: str | None = None, group_id: str | None = None,
+                 api_version: str = "5.199") -> None:
+        self.token = token or os.environ.get("VK_TOKEN")
+        if not self.token:
+            raise ValueError("VKNotifier: VK_TOKEN не задан")
+        self.group_id = group_id or os.environ.get("VK_GROUP_ID")
+        self.api_version = api_version
 
-    def send(self, recipient_id: str, message: str) -> bool:
-        if not self.token or not recipient_id:
-            return False
-        url = f"{self.api_url}/messages.send"
-        resp = requests.post(url, data={
-            "access_token": self.token,
-            "user_id": recipient_id,
-            "random_id": abs(hash((recipient_id, message))) % (2 ** 31),
-            "message": message,
-            "v": self.version,
-        }, timeout=10)
+    def _call(self, method: str, params: dict) -> dict:
+        params = dict(params)
+        params.update({"access_token": self.token, "v": self.api_version})
+        resp = requests.post(f"{self.API_URL}/{method}", data=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            log.warning("VK error: %s", data["error"])
-            return False
+            err = data["error"]
+            raise RuntimeError(
+                f"VK API error {err.get('error_code')}: {err.get('error_msg')}"
+            )
+        return data.get("response")
+
+    def _send_params(self, recipient_id: str) -> dict:
+        params = {"user_id": recipient_id, "random_id": random.randint(1, 2**31)}
+        if self.group_id:
+            params["group_id"] = self.group_id
+        return params
+
+    def send(self, recipient_id: str, message: str) -> bool:
+        params = self._send_params(recipient_id)
+        params["message"] = message
+        self._call("messages.send", params)
         return True
 
-    def send_photo(self, recipient_id: str, photo_data: bytes, caption: str = "",
-                   mime_type: str = "image/jpeg") -> bool:
-        """VK: загрузка фото на сервер -> сохранение -> отправка."""
-        if not self.token or not recipient_id:
-            return False
-        try:
-            # 1. Получаем сервер для загрузки
-            upload_url_resp = requests.post(
-                f"{self.api_url}/photos.getMessagesUploadServer",
-                data={"access_token": self.token, "v": self.version},
-                timeout=10
-            )
-            upload_url_resp.raise_for_status()
-            upload_data = upload_url_resp.json()
-            if "error" in upload_data:
-                log.warning("VK upload server error: %s", upload_data["error"])
-                return False
-            upload_url = upload_data["response"]["upload_url"]
-
-            # 2. Загружаем фото
-            files = {"photo": ("photo.jpg", photo_data, mime_type)}
-            upload_resp = requests.post(upload_url, files=files, timeout=20)
-            upload_resp.raise_for_status()
-            save_data = upload_resp.json()
-            if "error" in save_data:
-                log.warning("VK photo save error: %s", save_data["error"])
-                return False
-
-            # 3. Сохраняем фото
-            save_resp = requests.post(
-                f"{self.api_url}/photos.saveMessagesPhoto",
-                data={
-                    "access_token": self.token,
-                    "photo": save_data["photo"],
-                    "server": save_data["server"],
-                    "hash": save_data["hash"],
-                    "v": self.version,
-                },
-                timeout=10
-            )
-            save_resp.raise_for_status()
-            photo_info = save_resp.json()
-            if "error" in photo_info:
-                log.warning("VK save photo error: %s", photo_info["error"])
-                return False
-
-            photo = photo_info["response"][0]
-            attachment = f"photo{photo['owner_id']}_{photo['id']}"
-
-            # 4. Отправляем сообщение с вложением
-            message_text = caption or "Фото заказа"
-            send_resp = requests.post(
-                f"{self.api_url}/messages.send",
-                data={
-                    "access_token": self.token,
-                    "user_id": recipient_id,
-                    "random_id": abs(hash((recipient_id, message_text))) % (2 ** 31),
-                    "message": message_text,
-                    "attachment": attachment,
-                    "v": self.version,
-                },
-                timeout=10
-            )
-            send_resp.raise_for_status()
-            result = send_resp.json()
-            if "error" in result:
-                log.warning("VK send error: %s", result["error"])
-                return False
-            return True
-        except Exception as exc:
-            log.warning("VK send_photo error: %s", exc)
-            return False
+    def send_photo(self, recipient_id: str, photo_data: bytes,
+                   caption: str = "", mime_type: str = "image/jpeg") -> bool:
+        # 1. Получить URL для загрузки фото
+        upload = self._call("photos.getMessagesUploadServer", {"peer_id": recipient_id})
+        upload_url = upload["upload_url"]
+        # 2. Загрузить фото
+        resp = requests.post(
+            upload_url,
+            files={"photo": ("photo.jpg", photo_data, mime_type)},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        uploaded = resp.json()
+        # 3. Сохранить фото
+        saved = self._call("photos.saveMessagesPhoto", {
+            "photo": uploaded["photo"],
+            "server": uploaded["server"],
+            "hash": uploaded["hash"],
+        })
+        photo = saved[0]
+        attachment = f"photo{photo['owner_id']}_{photo['id']}"
+        # 4. Отправить сообщение с вложением
+        params = self._send_params(recipient_id)
+        params["attachment"] = attachment
+        if caption:
+            params["message"] = caption
+        self._call("messages.send", params)
+        return True
 
 
 class MaxNotifier:
-    """Уведомления через мессенджер MAX."""
+    """Уведомления через MAX Platform API (upload file → send message)."""
 
     name = "max"
+    DEFAULT_ENDPOINT = "https://platform-api2.max.ru"
 
-    def __init__(self, token: str = "", base_url: str = "https://platform-api2.max.ru"):
-        self.token = token or os.environ.get("MAX_TOKEN", "")
-        self.base_url = base_url
+    def __init__(self, token: str | None = None, endpoint: str | None = None) -> None:
+        self.token = token or os.environ.get("MAX_TOKEN")
+        if not self.token:
+            raise ValueError("MaxNotifier: MAX_TOKEN не задан")
+        self.endpoint = (
+            endpoint or os.environ.get("MAX_ENDPOINT") or self.DEFAULT_ENDPOINT
+        ).rstrip("/")
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.token}"}
 
     def send(self, recipient_id: str, message: str) -> bool:
-        if not self.token or not recipient_id:
-            log.info("MAX: не настроен, пропускаем")
-            return False
         resp = requests.post(
-            f"{self.base_url}/messages",
-            params={"user_id": recipient_id},
-            headers={"Authorization": self.token},
-            json={"text": message},
-            timeout=10,
+            f"{self.endpoint}/messages",
+            json={"recipient_id": recipient_id, "text": message},
+            headers=self._headers(),
+            timeout=15,
         )
         resp.raise_for_status()
         return True
 
-    def send_photo(self, recipient_id: str, photo_data: bytes, caption: str = "",
-                   mime_type: str = "image/jpeg") -> bool:
-        if not self.token or not recipient_id:
-            log.info("MAX: не настроен, пропускаем")
-            return False
-        try:
-            # 1. Загружаем файл
-            files = {"file": ("photo.jpg", photo_data, mime_type)}
-            resp = requests.post(
-                f"{self.base_url}/files",
-                headers={"Authorization": self.token},
-                files=files,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            file_data = resp.json()
-            file_id = file_data.get("file_id") or file_data.get("id")
-            if not file_id:
-                log.warning("MAX: не получен file_id: %s", file_data)
-                return False
-
-            # 2. Отправляем сообщение с фото
-            body = {
-                "text": caption or "Фото заказа",
-                "attachments": [{"type": "photo", "payload": {"file_id": file_id}}]
-            }
-            resp = requests.post(
-                f"{self.base_url}/messages",
-                params={"user_id": recipient_id},
-                headers={"Authorization": self.token},
-                json=body,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception as exc:
-            log.warning("MAX send_photo error: %s", exc)
-            return False
+    def send_photo(self, recipient_id: str, photo_data: bytes,
+                   caption: str = "", mime_type: str = "image/jpeg") -> bool:
+        # 1. Загрузить файл
+        resp = requests.post(
+            f"{self.endpoint}/files",
+            files={"file": ("photo.jpg", photo_data, mime_type)},
+            headers=self._headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        file_id = data.get("file_id") or data.get("id")
+        if not file_id:
+            raise RuntimeError("MAX API: не получен file_id")
+        # 2. Отправить сообщение с файлом
+        resp = requests.post(
+            f"{self.endpoint}/messages",
+            json={"recipient_id": recipient_id, "file_id": file_id, "caption": caption},
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
 
 
 def build_notifiers() -> dict[str, Notifier]:
-    return {
-        "telegram": TelegramNotifier(),
-        "vk": VKNotifier(),
-        "max": MaxNotifier(),
-    }
+    """Собирает нотификаторы из переменных окружения.
+
+    Канал включается только при наличии токена:
+    TG_TOKEN → telegram, VK_TOKEN → vk, MAX_TOKEN → max.
+    """
+    notifiers: dict[str, Notifier] = {}
+    if os.environ.get("TG_TOKEN"):
+        notifiers["telegram"] = TelegramNotifier()
+    if os.environ.get("VK_TOKEN"):
+        notifiers["vk"] = VKNotifier()
+    if os.environ.get("MAX_TOKEN"):
+        notifiers["max"] = MaxNotifier()
+    return notifiers
 
 
-def send_notifications(recipient_channels: dict[str, str],
-                       message: str,
-                       notifiers: dict[str, Notifier] | None = None,
+def send_notifications(recipient_channels: dict[str, str], message: str,
+                       notifiers: dict[str, Notifier],
                        photo_data: bytes | None = None,
                        photo_caption: str = "",
                        photo_mime: str = "image/jpeg",
-                       on_error: Callable[[str, str, Exception], None] | None = None) -> dict[str, bool]:
-    """Отправляет сообщение (и опционально фото) во все доступные каналы.
+                       on_error=None) -> dict[str, bool]:
+    """Отправляет уведомление во все каналы клиента.
 
-    recipient_channels: {канал: идентификатор получателя}
-    notifiers: {канал: экземпляр Notifier}
-    photo_data: байты фото (если есть)
-    photo_caption: подпись к фото
-    Возвращает {канал: успех}. Ошибка одного канала не влияет на остальные.
+    Каждый канал обрабатывается независимо: ошибка одного не влияет
+    на остальные. Каналы без ID получателя или без нотификатора
+    пропускаются (результат False). Если передан photo_data —
+    дополнительно отправляется фото.
+
+    Возвращает {channel: успех}.
     """
-    notifiers = notifiers or build_notifiers()
     results: dict[str, bool] = {}
     for channel, recipient_id in recipient_channels.items():
-        if not recipient_id:
-            continue
         notifier = notifiers.get(channel)
-        if notifier is None:
+        if notifier is None or not recipient_id:
             results[channel] = False
             continue
         try:
-            if photo_data and hasattr(notifier, 'send_photo'):
-                results[channel] = bool(notifier.send_photo(recipient_id, photo_data, photo_caption, photo_mime))
-            else:
-                results[channel] = bool(notifier.send(recipient_id, message))
-        except Exception as exc:  # noqa: BLE001 - изоляция каналов
-            log.warning("Канал %s не сработал: %s", channel, exc)
+            ok = bool(notifier.send(recipient_id, message))
+            if photo_data:
+                ok = bool(notifier.send_photo(
+                    recipient_id, photo_data, photo_caption, photo_mime
+                )) and ok
+            results[channel] = ok
+        except Exception as exc:  # noqa: BLE001 — один канал не ломает другие
             results[channel] = False
-            if on_error:
-                on_error(channel, message, exc)
+            if on_error is not None:
+                on_error(channel, exc)
     return results
 
 
-def order_status_message(order: Any, status_name: str) -> str:
+def order_status_message(order, status_name: str) -> str:
+    """Формирует текст уведомления о смене статуса заказа."""
     return (
         f"Ваш заказ #{order['id']} ({order['service_name']}): "
         f"статус изменился на «{status_name}».\n"
