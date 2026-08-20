@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Редактирование заказа #' ~ order['id'] if order else 'Новый заказ' }}{% endblock %}
+{% block content %}
+<h1>{{ 'Редактирование заказа #' ~ order['id'] if order else 'Новый заказ' }}</h1>
+
+<form method="post" enctype="multipart/form-data" class="form">
+  <label>Клиент
+    <select name="client_id" required>
+      {% for c in clients %}
+        <option value="{{ c['id'] }}" {% if order and order['client_id'] == c['id'] %}selected{% endif %}>{{ c['full_name'] }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Услуга
+    <select name="service_id" required>
+      {% for s in services %}
+        <option value="{{ s['id'] }}" {% if order and order['service_id'] == s['id'] %}selected{% endif %}>{{ s['name'] }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  {% if not order %}
+  <label>Статус
+    <select name="status_id">
+      {% for s in statuses %}
+        <option value="{{ s['id'] }}" {% if s['id'] == 1 %}selected{% endif %}>{{ s['name'] }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endif %}
+
+  <label>Описание
+    <textarea name="description" rows="3">{{ order['description'] if order else '' }}</textarea>
+  </label>
+
+  <label>Файл модели
+    <input type="text" name="model_file" value="{{ order['model_file'] if order else '' }}">
+  </label>
+
+  <label>Цена
+    <input type="number" name="price" step="any" value="{{ order['price'] if order else '' }}">
+  </label>
+
+  <label>Срок
+    <input type="date" name="deadline" value="{{ order['deadline'] if order else '' }}">
+  </label>
+
+  {% if not order %}
+  <label>Фото
+    <input type="file" name="photo" accept="image/*">
+  </label>
+  <label>Подпись к фото
+    <input type="text" name="photo_caption">
+  </label>
+  {% endif %}
+
+  <button type="submit" class="btn btn-primary">Сохранить</button>
+</form>
+{% endblock %}
