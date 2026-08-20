@@ -1,34 +1,43 @@
 {% extends "base.html" %}
-{% block title %}Клиент{% endblock %}
+{% block title %}{{ 'Редактирование клиента' if client else 'Новый клиент' }}{% endblock %}
 {% block content %}
-<h2>{{ 'Редактирование клиента' if client else 'Новый клиент' }}</h2>
-<form method="post" action="{{ url_for('client_update', cid=client.id) if client else url_for('client_create') }}" class="card form">
-  <label>ФИО *</label>
-  <input type="text" name="full_name" required value="{{ client.full_name if client else '' }}">
+<h1>{{ 'Редактирование клиента' if client else 'Новый клиент' }}</h1>
 
-  <label>Телефон</label>
-  <input type="text" name="phone" value="{{ client.phone or '' }}">
+<form method="post" class="form">
+  <label>ФИО *
+    <input type="text" name="full_name" required value="{{ client['full_name'] if client else '' }}">
+  </label>
 
-  <label>Telegram ID</label>
-  <input type="text" name="telegram_id" value="{{ client.telegram_id or '' }}">
+  <label>Телефон
+    <input type="text" name="phone" value="{{ client['phone'] if client else '' }}" placeholder="+79001234567">
+  </label>
 
-  <label>VK ID</label>
-  <input type="text" name="vk_id" value="{{ client.vk_id or '' }}">
+  <label>Telegram ID
+    <input type="text" name="telegram_id" value="{{ client['telegram_id'] if client else '' }}">
+  </label>
 
-  <label>MAX ID</label>
-  <input type="text" name="max_id" value="{{ client.max_id or '' }}">
+  <label>VK ID
+    <input type="text" name="vk_id" value="{{ client['vk_id'] if client else '' }}">
+  </label>
 
-  <label>Заметки</label>
-  <textarea name="notes">{{ client.notes or '' }}</textarea>
+  <label>MAX ID
+    <input type="text" name="max_id" value="{{ client['max_id'] if client else '' }}">
+  </label>
+
+  <label>Заметки
+    <textarea name="notes" rows="3">{{ client['notes'] if client else '' }}</textarea>
+  </label>
 
   <fieldset>
-    <legend>Уведомления включены:</legend>
-    {% set ch = channels or {} %}
-    <label class="check"><input type="checkbox" name="ch_telegram" {% if ch.get('telegram') %}checked{% endif %}> Telegram</label>
-    <label class="check"><input type="checkbox" name="ch_vk" {% if ch.get('vk') %}checked{% endif %}> VK</label>
-    <label class="check"><input type="checkbox" name="ch_max" {% if ch.get('max') %}checked{% endif %}> MAX</label>
+    <legend>Каналы уведомлений</legend>
+    {% for ch in ['telegram', 'vk', 'max'] %}
+    <label class="checkbox">
+      <input type="checkbox" name="channel_{{ ch }}" {% if channels and channels.get(ch) %}checked{% endif %}>
+      {{ ch }}
+    </label>
+    {% endfor %}
   </fieldset>
 
-  <button>Сохранить</button>
+  <button type="submit" class="btn btn-primary">Сохранить</button>
 </form>
 {% endblock %}
