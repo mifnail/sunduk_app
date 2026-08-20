@@ -1,58 +1,56 @@
 {% extends "base.html" %}
 {% block title %}Заказы{% endblock %}
 {% block content %}
-<h2>Заказы</h2>
+<h1>Заказы</h1>
 
-<form method="get" action="{{ url_for('orders') }}" class="card form row">
+<div class="toolbar">
+  <a class="btn btn-primary" href="{{ url_for('orders_new') }}">Новый заказ</a>
+</div>
+
+<form method="get" action="{{ url_for('orders_list') }}" class="filters">
   <select name="status">
     <option value="">Все статусы</option>
     {% for s in statuses %}
-    <option value="{{ s.id }}" {% if status_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+      <option value="{{ s['id'] }}" {% if filter_status == s['id'] %}selected{% endif %}>{{ s['name'] }}</option>
     {% endfor %}
   </select>
   <select name="client">
     <option value="">Все клиенты</option>
     {% for c in clients %}
-    <option value="{{ c.id }}" {% if client_id == c.id %}selected{% endif %}>{{ c.full_name }}</option>
+      <option value="{{ c['id'] }}" {% if filter_client == c['id'] %}selected{% endif %}>{{ c['full_name'] }}</option>
     {% endfor %}
   </select>
-  <button>Фильтр</button>
-  <a class="btn" href="{{ url_for('order_new') }}">Новый заказ</a>
+  <button type="submit" class="btn">Фильтровать</button>
+  {% if filter_status or filter_client %}
+    <a class="btn" href="{{ url_for('orders_list') }}">Сбросить</a>
+  {% endif %}
 </form>
 
-<table>
+<table class="table">
   <thead>
     <tr>
       <th>№</th>
-      <th>Фото</th>
       <th>Клиент</th>
       <th>Услуга</th>
-      <th>Описание</th>
       <th>Цена</th>
       <th>Срок</th>
       <th>Статус</th>
+      <th></th>
     </tr>
   </thead>
   <tbody>
     {% for o in orders %}
     <tr>
-      <td><a href="{{ url_for('order_detail', oid=o.id) }}">#{{ o.id }}</a></td>
-      <td>
-        {% if o.latest_photo %}
-        <a href="{{ url_for('order_detail', oid=o.id) }}">
-          <img src="{{ url_for('order_photo', photo_id=o.latest_photo.id) }}" class="thumb" alt="фото">
-        </a>
-        {% else %}
-        —
-        {% endif %}
-      </td>
-      <td>{{ o.client_name }}</td>
-      <td>{{ o.service_name }}</td>
-      <td>{{ o.description or '' }}</td>
-      <td>{{ o.price or '' }}</td>
-      <td>{{ o.deadline or '' }}</td>
-      <td><span class="badge">{{ o.status_name }}</span></td>
+      <td>{{ o['id'] }}</td>
+      <td>{{ o['client_name'] }}</td>
+      <td>{{ o['service_name'] }}</td>
+      <td>{{ "%.0f"|format(o['price'] or 0) }} ₽</td>
+      <td>{{ o['deadline'] or '—' }}</td>
+      <td><span class="badge">{{ o['status_name'] }}</span></td>
+      <td><a href="{{ url_for('order_detail', order_id=o['id']) }}">Открыть</a></td>
     </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">Заказов нет</td></tr>
     {% endfor %}
   </tbody>
 </table>
