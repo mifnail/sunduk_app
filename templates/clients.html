@@ -1,9 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Клиенты{% endblock %}
 {% block content %}
-<h2>Клиенты</h2>
-<a class="btn" href="{{ url_for('client_new') }}">Новый клиент</a>
-<table>
+<h1>Клиенты</h1>
+
+<div class="toolbar">
+  <a class="btn btn-primary" href="{{ url_for('clients_new') }}">Новый клиент</a>
+</div>
+
+<table class="table">
   <thead>
     <tr>
       <th>ФИО</th>
@@ -11,24 +15,33 @@
       <th>Telegram</th>
       <th>VK</th>
       <th>MAX</th>
+      <th>Каналы</th>
       <th></th>
     </tr>
   </thead>
   <tbody>
     {% for c in clients %}
     <tr>
-      <td>{{ c.full_name }}</td>
-      <td>{{ c.phone or '' }}</td>
-      <td>{{ c.telegram_id or '' }}</td>
-      <td>{{ c.vk_id or '' }}</td>
-      <td>{{ c.max_id or '' }}</td>
+      <td>{{ c['full_name'] }}</td>
+      <td>{{ c['phone'] or '—' }}</td>
+      <td>{{ c['telegram_id'] or '—' }}</td>
+      <td>{{ c['vk_id'] or '—' }}</td>
+      <td>{{ c['max_id'] or '—' }}</td>
       <td>
-        <a class="btn small" href="{{ url_for('client_edit', cid=c.id) }}">Изменить</a>
-        <form method="post" action="{{ url_for('client_delete', cid=c.id) }}" class="inline">
-          <button class="danger small" onclick="return confirm('Удалить клиента?')">Удалить</button>
+        {% for ch, enabled in c['channels'].items() %}
+          <span class="badge {{ 'badge-on' if enabled else 'badge-off' }}">{{ ch }}</span>
+        {% endfor %}
+      </td>
+      <td>
+        <a href="{{ url_for('clients_edit', client_id=c['id']) }}">Редактировать</a>
+        <form method="post" action="{{ url_for('clients_delete', client_id=c['id']) }}"
+              class="inline" onsubmit="return confirm('Удалить клиента?')">
+          <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
         </form>
       </td>
     </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">Клиентов нет</td></tr>
     {% endfor %}
   </tbody>
 </table>
