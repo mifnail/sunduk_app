@@ -1,77 +1,124 @@
-import os
-import tempfile
+"""Интеграционный тест: полный цикл заказа через Flask + уведомления."""
+
+import io
 
 import pytest
+
+from app import create_app
+from services.order_service import OrderService
+
+
+class FakeNotifier:
+    """Записывает уведомления, всегда успешен."""
+
+    def __init__(self, name="telegram"):
+        self.name = name
+        self.sent = []
+        self.photos = []
+
+    def send(self, recipient_id, message):
+        self.sent.append((recipient_id, message))
+        return True
+
+    def send_photo(self, recipient_id, photo_data, caption="", mime_type="image/jpeg"):
+        self.photos.append((recipient_id, photo_data, caption, mime_type))
+        return True
 
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
-    db_path = str(tmp_path / "integration.db")
-    monkeypatch.setenv("ORDERS_DB", db_path)
-    from app import create_app
-    return create_app()
+    app = create_app(str(tmp_path / "test.db"))
+    app.config["TESTING"] = True
+    fake = FakeNotifier()
+    # Подменяем build_notifiers, чтобы маршруты слали уведомления в фейк
+    monkeypatch.setattr("services.order_service.build_notifiers",
+                        lambda: {"telegram": fake})
+    app.extensions["fake_notifier"] = fake
+    return app
 
 
-def test_index_ok(app):
-    c = app.test_client()
-    r = c.get("/")
-    assert r.status_code == 200
+@pytest.fixture
+def client(app):
+    return app.test_client()
 
 
-def test_client_create_and_list(app):
-    c = app.test_client()
-    r = c.post("/clients/new", data={
-        "full_name": "Иванов Иван",
-        "phone": "+79000000000",
-        "telegram_id": "123",
-        "ch_telegram": "on",
-    }, follow_redirects=True)
-    assert r.status_code == 200
-    assert "Иванов Иван" in r.get_data(as_text=True)
+def test_full_order_lifecycle(client, app):
+    fake = app.extensions["fake_notifier"]
 
-
-def test_order_lifecycle(app):
-    c = app.test_client()
-    c.post("/clients/new", data={"full_name": "Петров Пётр", "telegram_id": "999"}, follow_redirects=True)
-    r = c.post("/orders/new", data={
-        "client_id": "1", "service_id": "1",
-        "description": "Ключница", "price": "800",
+    # 1. Клиент с включённым Telegram-каналом
+    r = client.post("/clients/new", data={
+        "full_name": "Иван",
+        "telegram_id": "111",
+        "channel_telegram": "on",
     }, follow_redirects=True)
     assert r.status_code == 200
 
-    r = c.post("/orders/1/status", data={"status_id": "3"}, follow_redirects=True)
+    # 2. Услуга
+    client.post("/services/new", data={"name": "3D-печать", "price": "100"},
+                follow_redirects=True)
+
+    # 3. Заказ с фото -> уведомление «принят»
+    photo = (io.BytesIO(b"img1"), "photo.jpg")
+    r = client.post("/orders/new", data={
+        "client_id": "1", "service_id": "1", "description": "Фигурка",
+        "price": "100", "photo": photo,
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert r.status_code == 200 and "Заказ #1" in r.get_data(as_text=True)
+    assert len(fake.sent) == 1
+    assert "принят" in fake.sent[0][1]
+    assert fake.photos == [("111", b"img1", "", "image/jpeg")]
+
+    # 4. Смена статуса -> уведомление «в работе»
+    fake.sent.clear()
+    r = client.post("/orders/1/status", data={"status_id": "2"}, follow_redirects=True)
+    assert r.status_code == 200 and "в работе" in r.get_data(as_text=True)
+    assert len(fake.sent) == 1
+    assert "в работе" in fake.sent[0][1]
+
+    # 5. Доп. услуга
+    client.post("/services/new", data={"name": "Постобработка", "price": "50"},
+                follow_redirects=True)
+    client.post("/orders/1/extra/add", data={"service_id": "2", "quantity": "2"},
+                follow_redirects=True)
+
+    # 6. Детали заказа содержат всё
+    r = client.get("/orders/1")
     body = r.get_data(as_text=True)
-    assert r.status_code == 200
-    assert "готов" in body
+    assert "Фигурка" in body
+    assert "Постобработка" in body
+    assert "в работе" in body
+    assert "принят" in body  # история статусов
 
-    # история сохранилась
-    r = c.get("/orders/1")
-    body = r.get_data(as_text=True)
-    assert body.count("готов") >= 1
+    # 7. Фото отдаётся
+    assert client.get("/orders/photo/1").data == b"img1"
+
+    # 8. Удаление заказа
+    r = client.post("/orders/1/delete", follow_redirects=True)
+    assert "Заказ удалён" in r.get_data(as_text=True)
+    assert client.get("/orders/1").status_code == 404
 
 
-def test_status_change_notifies_enabled_channels(app, monkeypatch):
-    c = app.test_client()
-    c.post("/clients/new", data={
-        "full_name": "Тест", "telegram_id": "tg1", "ch_telegram": "on",
+def test_notification_not_sent_for_disabled_channel(client, app):
+    fake = app.extensions["fake_notifier"]
+    client.post("/clients/new", data={
+        "full_name": "Пётр",
+        "telegram_id": "222",
+        # канал не включён
     }, follow_redirects=True)
-    c.post("/orders/new", data={"client_id": "1", "service_id": "1"}, follow_redirects=True)
+    client.post("/services/new", data={"name": "Печать"}, follow_redirects=True)
+    client.post("/orders/new", data={"client_id": "1", "service_id": "1"},
+                follow_redirects=True)
+    assert fake.sent == []
 
-    calls = []
 
-    class FakeTG:
-        name = "telegram"
-
-        def send(self, recipient_id, message):
-            calls.append((recipient_id, message))
-            return True
-
-    monkeypatch.setattr(
-        "app.build_notifiers",
-        lambda: {"telegram": FakeTG(), "vk": None, "max": None},
-    )
-
-    r = c.post("/orders/1/status", data={"status_id": "3"}, follow_redirects=True)
-    assert r.status_code == 200
-    assert calls and calls[0][0] == "tg1"
-    assert "готов" in calls[0][1]
+def test_notification_not_sent_for_empty_id(client, app):
+    fake = app.extensions["fake_notifier"]
+    client.post("/clients/new", data={
+        "full_name": "Пётр",
+        "telegram_id": "",
+        "channel_telegram": "on",
+    }, follow_redirects=True)
+    client.post("/services/new", data={"name": "Печать"}, follow_redirects=True)
+    client.post("/orders/new", data={"client_id": "1", "service_id": "1"},
+                follow_redirects=True)
+    assert fake.sent == []
