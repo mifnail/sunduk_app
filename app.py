@@ -1,405 +1,368 @@
-import os
+"""Flask-приложение: веб-интерфейс оператора.
+
+Маршруты соответствуют SPEC.md (раздел 3). Вся бизнес-логика
+вынесена в OrderService, все SQL — в Database. Каждый POST-маршрут
+следует паттерну: валидация → проверка существования → бизнес-правило
+→ операция → flash + redirect (PRG).
+"""
+
 import io
-from dotenv import load_dotenv
-from flask import Flask, render_template, request, redirect, url_for, abort, flash, send_file
+import os
 
-from db_schema import init_db, seed_defaults, migrate_db
-from database import Database
-from services.order_service import OrderService, NotificationPayload
+from flask import (Flask, abort, flash, redirect, render_template, request,
+                   send_file, url_for)
+
+from database import Database, _normalize_phone
+from services.order_service import OrderService
+
+#: Каналы уведомлений клиента (совпадает с CHECK-ограничением в БД).
+CHANNELS = ("telegram", "vk", "max")
 
 
-def create_app() -> Flask:
+def _int(value, default=None):
+    """Безопасное приведение к int. None/пусто/мусор → default."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value, default=None):
+    """Безопасное приведение к float. None/пусто/мусор → default."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def create_app(db_path: str | None = None) -> Flask:
+    """Фабрика приложения. db_path можно передать для тестов."""
     app = Flask(__name__)
-    instance = os.path.join(app.root_path, "instance")
-    os.makedirs(instance, exist_ok=True)
-    db_path = os.environ.get("ORDERS_DB", os.path.join(instance, "orders.db"))
-    app.config.from_mapping(
-        DATABASE=db_path,
-        SECRET_KEY=os.environ.get("SECRET_KEY", "dev"),
-    )
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+    db_path = db_path or os.environ.get("ORDERS_DB", "instance/orders.db")
 
-    init_db(db_path)
-    seed_defaults(db_path)
-    migrate_db(db_path)
+    db = Database(db_path)
+    service = OrderService(db)
+    app.extensions["db"] = db
+    app.extensions["order_service"] = service
 
-    database = Database(db_path)
-    order_service = OrderService(database)
-
-    def db() -> Database:
-        return database
-
-    # ---------- Главная ----------
-
+    # ------------------------------------------------------------------
+    # Главная
+    # ------------------------------------------------------------------
     @app.get("/")
     def index():
-        d = db()
-        return render_template(
-            "index.html",
-            orders=d.list_orders(),
-            statuses=d.list_statuses(),
-        )
+        return redirect(url_for("orders_list"))
 
-    # ---------- Клиенты ----------
-
+    # ------------------------------------------------------------------
+    # Клиенты
+    # ------------------------------------------------------------------
     @app.get("/clients")
-    def clients():
-        return render_template("clients.html", clients=db().list_clients())
+    def clients_list():
+        clients = []
+        for c in db.list_clients():
+            row = dict(c)
+            row["channels"] = db.get_client_channels(c["id"])
+            clients.append(row)
+        return render_template("clients.html", clients=clients)
 
     @app.get("/clients/new")
-    def client_new():
-        return render_template("client_form.html", client=None)
+    def clients_new():
+        return render_template("client_form.html", client=None, channels={})
 
     @app.post("/clients/new")
-    def client_create():
-        d = db()
+    def clients_create():
         full_name = request.form.get("full_name", "").strip()
         if not full_name:
-            flash("Укажите ФИО клиента")
-            return redirect(url_for("client_new"))
-        cid = d.add_client(
+            flash("Укажите ФИО", "error")
+            return redirect(url_for("clients_new"))
+        client_id = db.add_client(
             full_name=full_name,
-            phone=request.form.get("phone", ""),
-            telegram_id=request.form.get("telegram_id", ""),
-            vk_id=request.form.get("vk_id", ""),
-            max_id=request.form.get("max_id", ""),
-            notes=request.form.get("notes", ""),
+            phone=_normalize_phone(request.form.get("phone")),
+            telegram_id=request.form.get("telegram_id") or None,
+            vk_id=request.form.get("vk_id") or None,
+            max_id=request.form.get("max_id") or None,
+            notes=request.form.get("notes") or None,
         )
-        for ch in ("telegram", "vk", "max"):
-            d.set_channel(cid, ch, bool(request.form.get(f"ch_{ch}")))
-        flash("Клиент добавлен")
-        return redirect(url_for("clients"))
+        for channel in CHANNELS:
+            db.set_channel(client_id, channel,
+                           request.form.get(f"channel_{channel}") == "on")
+        flash("Клиент добавлен", "success")
+        return redirect(url_for("clients_list"))
 
-    @app.get("/clients/<int:cid>/edit")
-    def client_edit(cid: int):
-        d = db()
-        client = d.get_client(cid)
+    @app.get("/clients/<int:client_id>/edit")
+    def clients_edit(client_id):
+        client = db.get_client(client_id)
         if client is None:
             abort(404)
-        channels = {c["channel"]: c["enabled"] for c in d.list_channels(cid)}
-        return render_template("client_form.html", client=client, channels=channels)
+        return render_template(
+            "client_form.html",
+            client=client,
+            channels=db.get_client_channels(client_id),
+        )
 
-    @app.post("/clients/<int:cid>/edit")
-    def client_update(cid: int):
-        d = db()
+    @app.post("/clients/<int:client_id>/edit")
+    def clients_update(client_id):
+        client = db.get_client(client_id)
+        if client is None:
+            abort(404)
         full_name = request.form.get("full_name", "").strip()
         if not full_name:
-            flash("Укажите ФИО клиента")
-            return redirect(url_for("client_edit", cid=cid))
-        d.update_client(
-            cid,
+            flash("Укажите ФИО", "error")
+            return redirect(url_for("clients_edit", client_id=client_id))
+        db.update_client(
+            client_id,
             full_name=full_name,
-            phone=request.form.get("phone", ""),
-            telegram_id=request.form.get("telegram_id", ""),
-            vk_id=request.form.get("vk_id", ""),
-            max_id=request.form.get("max_id", ""),
-            notes=request.form.get("notes", ""),
+            phone=_normalize_phone(request.form.get("phone")),
+            telegram_id=request.form.get("telegram_id") or None,
+            vk_id=request.form.get("vk_id") or None,
+            max_id=request.form.get("max_id") or None,
+            notes=request.form.get("notes") or None,
         )
-        for ch in ("telegram", "vk", "max"):
-            d.set_channel(cid, ch, bool(request.form.get(f"ch_{ch}")))
-        flash("Клиент обновлён")
-        return redirect(url_for("clients"))
+        for channel in CHANNELS:
+            db.set_channel(client_id, channel,
+                           request.form.get(f"channel_{channel}") == "on")
+        flash("Клиент обновлён", "success")
+        return redirect(url_for("clients_list"))
 
-    @app.post("/clients/<int:cid>/delete")
-    def client_delete(cid: int):
-        d = db()
-        if d.has_orders_for_client(cid):
-            flash("Нельзя удалить клиента: у него есть заказы")
-            return redirect(url_for("clients"))
-        d.delete_client(cid)
-        flash("Клиент удалён")
-        return redirect(url_for("clients"))
+    @app.post("/clients/<int:client_id>/delete")
+    def clients_delete(client_id):
+        if db.has_orders_for_client(client_id):
+            flash("Нельзя удалить: у клиента есть заказы", "error")
+            return redirect(url_for("clients_list"))
+        db.delete_client(client_id)
+        flash("Клиент удалён", "success")
+        return redirect(url_for("clients_list"))
 
-    # ---------- Услуги ----------
-
+    # ------------------------------------------------------------------
+    # Услуги
+    # ------------------------------------------------------------------
     @app.get("/services")
-    def services():
-        return render_template("services.html", services=db().list_services())
+    def services_list():
+        return render_template("services.html", services=db.list_services())
 
     @app.post("/services/new")
-    def service_create():
-        d = db()
+    def services_create():
         name = request.form.get("name", "").strip()
         if not name:
-            flash("Укажите название услуги")
-            return redirect(url_for("services"))
-        if d.get_service_by_name(name) is not None:
-            flash("Услуга с таким названием уже существует")
-            return redirect(url_for("services"))
-        d.add_service(
-            name=name,
-            unit=request.form.get("unit", ""),
-            price=_price(request.form.get("price")),
-        )
-        flash("Услуга добавлена")
-        return redirect(url_for("services"))
+            flash("Укажите название услуги", "error")
+            return redirect(url_for("services_list"))
+        if db.get_service_by_name(name):
+            flash("Услуга уже существует", "error")
+            return redirect(url_for("services_list"))
+        db.add_service(name=name,
+                       unit=request.form.get("unit") or None,
+                       price=_float(request.form.get("price")))
+        flash("Услуга добавлена", "success")
+        return redirect(url_for("services_list"))
 
-    @app.post("/services/<int:sid>/delete")
-    def service_delete(sid: int):
-        d = db()
-        if d.has_orders_for_service(sid):
-            flash("Нельзя удалить услугу: она используется в заказах")
-            return redirect(url_for("services"))
-        d.delete_service(sid)
-        flash("Услуга удалена")
-        return redirect(url_for("services"))
-
-    @app.post("/services/<int:sid>/update")
-    def service_update(sid: int):
-        d = db()
-        service = d.get_service(sid)
-        if service is None:
+    @app.post("/services/<int:service_id>/update")
+    def services_update(service_id):
+        service_row = db.get_service(service_id)
+        if service_row is None:
             abort(404)
         name = request.form.get("name", "").strip()
         if not name:
-            flash("Название не может быть пустым")
-            return redirect(url_for("services"))
-        # Check for duplicate name (excluding current)
-        existing = d.get_service_by_name(name)
-        if existing and existing["id"] != sid:
-            flash("Услуга с таким названием уже существует")
-            return redirect(url_for("services"))
-        d.update_service(
-            sid,
-            name=name,
-            unit=request.form.get("unit", ""),
-            price=_price(request.form.get("price")),
-        )
-        flash("Услуга обновлена")
-        return redirect(url_for("services"))
+            flash("Укажите название услуги", "error")
+            return redirect(url_for("services_list"))
+        existing = db.get_service_by_name(name)
+        if existing and existing["id"] != service_id:
+            flash("Услуга уже существует", "error")
+            return redirect(url_for("services_list"))
+        db.update_service(service_id,
+                          name=name,
+                          unit=request.form.get("unit") or None,
+                          price=_float(request.form.get("price")))
+        flash("Услуга обновлена", "success")
+        return redirect(url_for("services_list"))
 
-    # ---------- Фото заказов ----------
+    @app.post("/services/<int:service_id>/delete")
+    def services_delete(service_id):
+        if db.has_orders_for_service(service_id):
+            flash("Нельзя удалить: услуга используется в заказах", "error")
+            return redirect(url_for("services_list"))
+        db.delete_service(service_id)
+        flash("Услуга удалена", "success")
+        return redirect(url_for("services_list"))
+
+    # ------------------------------------------------------------------
+    # Заказы
+    # ------------------------------------------------------------------
+    @app.get("/orders")
+    def orders_list():
+        status_id = _int(request.args.get("status"))
+        client_id = _int(request.args.get("client"))
+        return render_template(
+            "orders.html",
+            orders=service.list_orders(status_id=status_id, client_id=client_id),
+            statuses=db.list_statuses(),
+            clients=db.list_clients(),
+            filter_status=status_id,
+            filter_client=client_id,
+        )
+
+    @app.get("/orders/new")
+    def orders_new():
+        return render_template(
+            "order_form.html",
+            order=None,
+            clients=db.list_clients(),
+            services=db.list_services(),
+            statuses=db.list_statuses(),
+        )
+
+    @app.post("/orders/new")
+    def orders_create():
+        client_id = _int(request.form.get("client_id"))
+        service_id = _int(request.form.get("service_id"))
+        if client_id is None or db.get_client(client_id) is None:
+            flash("Выберите существующего клиента", "error")
+            return redirect(url_for("orders_new"))
+        if service_id is None or db.get_service(service_id) is None:
+            flash("Выберите существующую услугу", "error")
+            return redirect(url_for("orders_new"))
+        status_id = _int(request.form.get("status_id"), default=1)
+        if status_id is None or db.get_status(status_id) is None:
+            status_id = 1
+        photo = request.files.get("photo")
+        photo_data = photo.read() if photo and photo.filename else None
+        order_id = service.create_order(
+            client_id=client_id,
+            service_id=service_id,
+            description=request.form.get("description", ""),
+            model_file=request.form.get("model_file", ""),
+            price=_float(request.form.get("price")),
+            deadline=request.form.get("deadline", ""),
+            status_id=status_id,
+            photo_data=photo_data,
+            photo_caption=request.form.get("photo_caption", ""),
+        )
+        flash("Заказ создан", "success")
+        return redirect(url_for("order_detail", order_id=order_id))
+
+    @app.get("/orders/<int:order_id>")
+    def order_detail(order_id):
+        detail = service.get_order_detail(order_id)
+        if detail is None:
+            abort(404)
+        return render_template(
+            "order_detail.html",
+            order=detail,
+            statuses=db.list_statuses(),
+            services=db.list_services(),
+        )
+
+    @app.get("/orders/<int:order_id>/edit")
+    def orders_edit(order_id):
+        order = db.get_order(order_id)
+        if order is None:
+            abort(404)
+        return render_template(
+            "order_form.html",
+            order=order,
+            clients=db.list_clients(),
+            services=db.list_services(),
+            statuses=db.list_statuses(),
+        )
+
+    @app.post("/orders/<int:order_id>/edit")
+    def orders_update(order_id):
+        order = db.get_order(order_id)
+        if order is None:
+            abort(404)
+        client_id = _int(request.form.get("client_id"))
+        service_id = _int(request.form.get("service_id"))
+        if client_id is None or db.get_client(client_id) is None:
+            flash("Выберите существующего клиента", "error")
+            return redirect(url_for("orders_edit", order_id=order_id))
+        if service_id is None or db.get_service(service_id) is None:
+            flash("Выберите существующую услугу", "error")
+            return redirect(url_for("orders_edit", order_id=order_id))
+        db.update_order(
+            order_id,
+            client_id=client_id,
+            service_id=service_id,
+            description=request.form.get("description", ""),
+            model_file=request.form.get("model_file", ""),
+            price=_float(request.form.get("price")),
+            deadline=request.form.get("deadline", ""),
+        )
+        flash("Заказ обновлён", "success")
+        return redirect(url_for("order_detail", order_id=order_id))
+
+    @app.post("/orders/<int:order_id>/status")
+    def orders_status(order_id):
+        order = db.get_order(order_id)
+        if order is None:
+            abort(404)
+        status_id = _int(request.form.get("status_id"))
+        if status_id is None or status_id <= 0:
+            flash("Неверный статус", "error")
+            return redirect(url_for("order_detail", order_id=order_id))
+        status = db.get_status(status_id)
+        if status is None:
+            flash("Статус не найден", "error")
+            return redirect(url_for("order_detail", order_id=order_id))
+        if order["status_id"] == status_id:
+            flash("Статус не изменился", "error")
+            return redirect(url_for("order_detail", order_id=order_id))
+        photo = request.files.get("status_photo")
+        photo_data = photo.read() if photo and photo.filename else None
+        service.change_status(
+            order_id,
+            status_id,
+            photo_data=photo_data,
+            photo_caption=request.form.get("photo_caption", ""),
+        )
+        flash(f"Статус изменён на «{status['name']}»", "success")
+        return redirect(url_for("order_detail", order_id=order_id))
+
+    @app.post("/orders/<int:order_id>/delete")
+    def orders_delete(order_id):
+        if db.get_order(order_id) is None:
+            abort(404)
+        db.delete_order(order_id)
+        flash("Заказ удалён", "success")
+        return redirect(url_for("orders_list"))
+
+    @app.post("/orders/<int:order_id>/extra/add")
+    def orders_extra_add(order_id):
+        if db.get_order(order_id) is None:
+            abort(404)
+        service_id = _int(request.form.get("service_id"))
+        if service_id is None or db.get_service(service_id) is None:
+            flash("Выберите существующую услугу", "error")
+            return redirect(url_for("order_detail", order_id=order_id))
+        quantity = _float(request.form.get("quantity"), default=1) or 1
+        price = _float(request.form.get("price"))
+        service.add_extra_service(order_id, service_id, quantity=quantity, price=price)
+        flash("Доп. услуга добавлена", "success")
+        return redirect(url_for("order_detail", order_id=order_id))
+
+    @app.post("/orders/<int:order_id>/extra/remove/<int:service_id>")
+    def orders_extra_remove(order_id, service_id):
+        if db.get_order(order_id) is None:
+            abort(404)
+        service.remove_extra_service(order_id, service_id)
+        flash("Доп. услуга удалена", "success")
+        return redirect(url_for("order_detail", order_id=order_id))
 
     @app.get("/orders/photo/<int:photo_id>")
-    def order_photo(photo_id: int):
-        """Отдаёт фото заказа по ID."""
-        d = db()
-        photo = d.get_order_photo(photo_id)
+    def order_photo(photo_id):
+        photo = db.get_order_photo(photo_id)
         if photo is None:
             abort(404)
         return send_file(
             io.BytesIO(photo["photo_data"]),
             mimetype=photo["mime_type"],
-            as_attachment=False,
-            download_name=f"order_photo_{photo_id}.jpg"
+            download_name=f"photo_{photo_id}",
         )
-
-    # ---------- Заказы ----------
-
-    @app.get("/orders")
-    def orders():
-        d = db()
-        status_id = _int(request.args.get("status"))
-        client_id = _int(request.args.get("client"))
-        orders_list = d.list_orders_with_photos(status_id=status_id, client_id=client_id)
-        return render_template(
-            "orders.html",
-            orders=orders_list,
-            statuses=d.list_statuses(),
-            clients=d.list_clients(),
-            status_id=status_id,
-            client_id=client_id,
-        )
-
-    @app.get("/orders/new")
-    def order_new():
-        d = db()
-        return render_template(
-            "order_detail.html",
-            order=None,
-            clients=d.list_clients(),
-            services=d.list_services(),
-            statuses=d.list_statuses(),
-        )
-
-    @app.post("/orders/new")
-    def order_create():
-        d = db()
-        client_id = _int(request.form.get("client_id"))
-        service_id = _int(request.form.get("service_id"))
-        if client_id is None or d.get_client(client_id) is None:
-            flash("Выберите существующего клиента")
-            return redirect(url_for("order_new"))
-        if service_id is None or d.get_service(service_id) is None:
-            flash("Выберите существующую услугу")
-            return redirect(url_for("order_new"))
-
-        # Handle photo upload
-        photo_file = request.files.get("photo")
-        photo_data = None
-        photo_caption = ""
-        photo_mime = "image/jpeg"
-        if photo_file and photo_file.filename:
-            photo_data = photo_file.read()
-            photo_caption = request.form.get("photo_caption", "")
-            photo_mime = photo_file.mimetype or "image/jpeg"
-
-        order_id = order_service.create_order(
-            client_id=client_id,
-            service_id=service_id,
-            description=request.form.get("description", ""),
-            model_file=request.form.get("model_file", ""),
-            price=_price(request.form.get("price")),
-            deadline=request.form.get("deadline", ""),
-            status_id=_int(request.form.get("status_id", 1)) or 1,
-            photo_data=photo_data,
-            photo_caption=photo_caption,
-            photo_mime=photo_mime
-        )
-
-        flash("Заказ создан")
-        return redirect(url_for("orders"))
-
-    @app.get("/orders/<int:oid>")
-    def order_detail(oid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        return render_template(
-            "order_detail.html",
-            order=order,
-            history=d.order_history(oid),
-            statuses=d.list_statuses(),
-            photos=d.get_order_photos(oid),
-            extra_services=d.get_order_services(oid),
-            extra_total=d.calculate_extra_total(oid),
-            services=d.list_services(),
-        )
-
-    @app.post("/orders/<int:oid>/status")
-    def order_set_status(oid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        status = d.get_status(_int(request.form.get("status_id")) or 0)
-        if status is None:
-            flash("Указанный статус не существует")
-            return redirect(url_for("order_detail", oid=oid))
-        status_id = status["id"]
-        if status_id == order["status_id"]:
-            flash("Статус не изменился")
-            return redirect(url_for("order_detail", oid=oid))
-
-        # Handle status photo upload
-        photo_file = request.files.get("status_photo")
-        photo_data = None
-        photo_caption = ""
-        photo_mime = "image/jpeg"
-        if photo_file and photo_file.filename:
-            photo_data = photo_file.read()
-            photo_caption = request.form.get("photo_caption", "")
-            photo_mime = photo_file.mimetype or "image/jpeg"
-
-        success = order_service.change_status(
-            order_id=oid,
-            new_status_id=status_id,
-            photo_data=photo_data,
-            photo_caption=photo_caption,
-            photo_mime=photo_mime
-        )
-
-        if success:
-            flash("Статус изменён, клиент уведомлён")
-        else:
-            flash("Ошибка при смене статуса")
-        return redirect(url_for("order_detail", oid=oid))
-
-    @app.post("/orders/<int:oid>/delete")
-    def order_delete(oid: int):
-        db().delete_order(oid)
-        flash("Заказ удалён")
-        return redirect(url_for("orders"))
-
-    # ---------- Редактирование заказа ----------
-    
-    @app.get("/orders/<int:oid>/edit")
-    def order_edit(oid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        return render_template(
-            "order_detail.html",
-            order=order,
-            history=d.order_history(oid),
-            statuses=d.list_statuses(),
-            photos=d.get_order_photos(oid),
-            extra_services=d.get_order_services(oid),
-            extra_total=d.calculate_extra_total(oid),
-            services=d.list_services(),
-            edit_mode=True,
-        )
-
-    @app.post("/orders/<int:oid>/edit")
-    def order_update(oid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        
-        description = request.form.get("description", "").strip()
-        model_file = request.form.get("model_file", "").strip()
-        price = _price(request.form.get("price"))
-        deadline = request.form.get("deadline", "").strip()
-        
-        d.update_order(
-            oid,
-            description=description,
-            model_file=model_file,
-            price=price,
-            deadline=deadline,
-        )
-        
-        flash("Заказ обновлён")
-        return redirect(url_for("order_detail", oid=oid))
-
-    # ---------- Дополнительные услуги к заказу ----------
-
-    @app.post("/orders/<int:oid>/extra/add")
-    def add_extra_service(oid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        service_id = _int(request.form.get("service_id"))
-        if service_id is None or d.get_service(service_id) is None:
-            flash("Выберите существующую услугу")
-            return redirect(url_for("order_detail", oid=oid))
-        quantity = _price(request.form.get("quantity")) or 1
-        price = _price(request.form.get("price"))
-        order_service.add_extra_service(oid, service_id, quantity=quantity, price=price)
-        flash("Доп. услуга добавлена")
-        return redirect(url_for("order_detail", oid=oid))
-
-    @app.post("/orders/<int:oid>/extra/remove/<int:sid>")
-    def remove_extra_service(oid: int, sid: int):
-        d = db()
-        order = d.get_order(oid)
-        if order is None:
-            abort(404)
-        order_service.remove_extra_service(oid, sid)
-        flash("Доп. услуга удалена")
-        return redirect(url_for("order_detail", oid=oid))
 
     return app
 
 
-def _int(value: object) -> int | None:
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _price(value: object) -> float | None:
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
 app = create_app()
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000,
+            debug=os.environ.get("FLASK_DEBUG") == "1")
