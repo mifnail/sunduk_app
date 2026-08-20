@@ -1,13 +1,12 @@
 [Unit]
-Description=Orders — студия 3D (Flask)
+Description=Orders web app (Flask)
 After=network.target
 
 [Service]
-Type=simple
 User=pi
 WorkingDirectory=/opt/orders_app
+ExecStart=/opt/orders_app/venv/bin/python app.py
 EnvironmentFile=/opt/orders_app/.env
-ExecStart=/opt/orders_app/venv/bin/python /opt/orders_app/app.py
 Restart=always
 RestartSec=5
 
