@@ -1,1234 +1,1187 @@
-"""Чат-бот MAX для оператора студии 3D-печати/сканирования.
+"""Бот MAX для оператора: Long Polling + FSM + inline-кнопки.
 
-Бот работает в режиме Long Polling (GET /updates).
-Полностью кнопочный интерфейс — команды вводить не нужно.
-Поддерживает: создание заказа с фото, смену статуса с фото, просмотр заказов/клиентов.
+ВАЖНО: это бот ОПЕРАТОРА (max_bot.py, класс MaxBot). Уведомления
+КЛИЕНТАМ через MAX — это notifier.MaxNotifier. Не путать!
+
+Работает через Long Polling (GET /updates), без вебхуков/HTTPS.
+FSM хранится в dict: user_id -> {"state": State, "data": {...}}.
+Callback data формат: action:sub_action:param1:param2.
+
+Формат апдейта от MAX API (адаптируется под реальный ответ):
+{
+    "update_id": 123,
+    "user_id": "6880711",
+    "text": "привет",              # для текстовых сообщений
+    "photo": {"data": b"..."},     # для фото (data или url)
+    "callback_data": "menu:main",  # для нажатий на кнопки
+    "callback_id": "abc",          # id колбэка для подтверждения
+}
 """
 
-import logging
 import os
 import time
-from enum import Enum
-from typing import Any
+from enum import Enum, auto
 
 import requests
-from dotenv import load_dotenv
 
 from database import Database
-from db_schema import init_db, seed_defaults, migrate_db
-from services.order_service import OrderService, NotificationPayload
+from services.order_service import OrderService
 
-log = logging.getLogger("max_bot")
 
-BASE_URL = "https://platform-api2.max.ru"
+def _float(value, default=None):
+    """Безопасное приведение к float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-# ---------- FSM States ----------
 
 class State(Enum):
-    MAIN_MENU = "main_menu"
-    # Order creation flow
-    CHOOSING_CLIENT = "choosing_client"
-    CHOOSING_SERVICE = "choosing_service"
-    ENTERING_DESCRIPTION = "entering_description"
-    AWAITING_PHOTO = "awaiting_photo"
-    CONFIRMING_ORDER = "confirming_order"
-    # Status change flow
-    CHOOSING_STATUS = "choosing_status"
-    AWAITING_STATUS_PHOTO = "awaiting_status_photo"
-    CONFIRMING_STATUS_CHANGE = "confirming_status_change"
-    # View order
-    VIEWING_ORDER = "viewing_order"
-    # Client management
-    CHOOSING_CLIENT_ACTION = "choosing_client_action"
-    ENTERING_CLIENT_NAME = "entering_client_name"
-    ENTERING_CLIENT_PHONE = "entering_client_phone"
-    ENTERING_CLIENT_TG_ID = "entering_client_tg_id"
-    ENTERING_CLIENT_VK_ID = "entering_client_vk_id"
-    ENTERING_CLIENT_MAX_ID = "entering_client_max_id"
-    ENTERING_CLIENT_NOTES = "entering_client_notes"
-    CONFIRMING_CLIENT_CREATE = "confirming_client_create"
-    CONFIRMING_CLIENT_UPDATE = "confirming_client_update"
-    CONFIRMING_CLIENT_DELETE = "confirming_client_delete"
-    # Order edit
-    CHOOSING_ORDER_EDIT_FIELD = "choosing_order_edit_field"
-    EDITING_ORDER_DESCRIPTION = "editing_order_description"
-    EDITING_ORDER_PRICE = "editing_order_price"
-    EDITING_ORDER_DEADLINE = "editing_order_deadline"
-    CONFIRMING_ORDER_EDIT = "confirming_order_edit"
-    CONFIRMING_ORDER_DELETE = "confirming_order_delete"
+    """Состояния FSM бота."""
 
-# ---------- Keyboards ----------
-
-def main_menu_keyboard() -> list:
-    return [
-        [{"type": "callback", "text": "📋 Заказы", "payload": "menu:orders"}],
-        [{"type": "callback", "text": "➕ Новый заказ", "payload": "menu:new_order"}],
-        [{"type": "callback", "text": "👥 Клиенты", "payload": "menu:clients"}],
-        [{"type": "callback", "text": "⚙️ Услуги", "payload": "menu:services"}],
-    ]
-
-def back_button(target: str = "menu:main") -> list:
-    return [[{"type": "callback", "text": "⬅️ Назад", "payload": target}]]
-
-def cancel_button() -> list:
-    return [[{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]]
-
-def skip_photo_button() -> list:
-    return [[{"type": "callback", "text": "⏭ Пропустить фото", "payload": "skip_photo"}]]
-
-def confirm_keyboard(confirm_payload: str, cancel_payload: str = "menu:main") -> list:
-    return [
-        [{"type": "callback", "text": "✅ Подтвердить", "payload": confirm_payload}],
-        [{"type": "callback", "text": "❌ Отмена", "payload": cancel_payload}],
-    ]
-
-
-def cancel_button() -> list:
-    return [[{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]]
+    MAIN_MENU = auto()
+    # Создание заказа
+    CHOOSING_CLIENT = auto()
+    CHOOSING_SERVICE = auto()
+    ENTERING_DESCRIPTION = auto()
+    AWAITING_PHOTO = auto()
+    CONFIRMING_ORDER = auto()
+    # Смена статуса
+    CHOOSING_STATUS = auto()
+    AWAITING_STATUS_PHOTO = auto()
+    CONFIRMING_STATUS_CHANGE = auto()
+    # Просмотр
+    VIEWING_ORDER = auto()
+    # Клиенты
+    CHOOSING_CLIENT_ACTION = auto()
+    ENTERING_CLIENT_NAME = auto()
+    ENTERING_CLIENT_PHONE = auto()
+    ENTERING_CLIENT_TG_ID = auto()
+    ENTERING_CLIENT_VK_ID = auto()
+    ENTERING_CLIENT_MAX_ID = auto()
+    ENTERING_CLIENT_NOTES = auto()
+    CONFIRMING_CLIENT_CREATE = auto()
+    CONFIRMING_CLIENT_UPDATE = auto()
+    CONFIRMING_CLIENT_DELETE = auto()
+    # Редактирование заказа
+    CHOOSING_ORDER_EDIT_FIELD = auto()
+    EDITING_ORDER_DESCRIPTION = auto()
+    EDITING_ORDER_PRICE = auto()
+    EDITING_ORDER_DEADLINE = auto()
+    CONFIRMING_ORDER_EDIT = auto()
+    CONFIRMING_ORDER_DELETE = auto()
+    # Услуги
+    ENTERING_SERVICE_NAME = auto()
+    ENTERING_SERVICE_PRICE = auto()
+    CONFIRMING_SERVICE_CREATE = auto()
+    CONFIRMING_SERVICE_DELETE = auto()
 
 
 class MaxBot:
-    def __init__(self, token: str = "", admin_ids: str = "",
-                 db_path: str = "instance/orders.db",
-                 base_url: str = BASE_URL,
-                 poll_timeout: int = 30,
-                 session: requests.Session | None = None,
-                 order_service: OrderService | None = None):
-        self.token = token or os.environ.get("MAX_TOKEN", "")
-        self.base_url = base_url
-        self.admin_ids = {x.strip() for x in (admin_ids or os.environ.get("MAX_ADMIN_ID", "")).split(",") if x.strip()}
-        self.db = Database(db_path)
-        self.order_service = order_service or OrderService(self.db)
-        self.poll_timeout = poll_timeout
-        self.marker = None
-        self.session = session or requests.Session()
-        # FSM: user_id -> {"state": State, "data": {...}}
-        self.user_states: dict[str, dict[str, Any]] = {}
+    """Long Polling бот оператора в мессенджере MAX."""
 
-    # ---------- HTTP ----------
+    def __init__(self, token: str, endpoint: str, admin_ids,
+                 db: Database, service: OrderService) -> None:
+        self.token = token
+        self.endpoint = endpoint.rstrip("/")
+        self.admin_ids = {str(x) for x in admin_ids}
+        self.db = db
+        self.service = service
+        self.user_states: dict[str, dict] = {}
+        self.last_update_id = 0
+        self.session = requests.Session()
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": self.token}
+    # ------------------------------------------------------------------
+    # HTTP-обёртки (легко мокаются в тестах)
+    # ------------------------------------------------------------------
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.token}"}
 
-    def send_message(self, user_id: str, text: str, buttons: list | None = None) -> bool:
-        body: dict = {"text": text}
-        if buttons:
-            body["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-        log.info("send_message → user_id=%s, text=%.80s", user_id, text)
-        resp = self.session.post(
-            f"{self.base_url}/messages",
-            params={"user_id": user_id},
-            headers=self._headers(),
-            json=body,
-            timeout=15,
-        )
-        log.info("send_message ← %s %s", resp.status_code, resp.text[:200])
-        resp.raise_for_status()
-        return True
-
-    def send_photo(self, user_id: str, photo_data: bytes, caption: str = "",
-                   buttons: list | None = None) -> bool:
-        """Отправка фото пользователю (через загрузку файла + сообщение с вложением)."""
-        # 1. Загружаем файл
-        files = {"file": ("photo.jpg", photo_data, "image/jpeg")}
-        resp = self.session.post(
-            f"{self.base_url}/files",
-            headers=self._headers(),
-            files=files,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        file_data = resp.json()
-        file_id = file_data.get("file_id") or file_data.get("id")
-        if not file_id:
-            log.error("Не получен file_id при загрузке фото: %s", file_data)
-            return False
-
-        # 2. Отправляем сообщение с прикреплённым фото
-        body: dict = {"text": caption}
-        if buttons:
-            body["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-        body["attachments"] = body.get("attachments", []) + [
-            {"type": "photo", "payload": {"file_id": file_id}}
-        ]
-        resp = self.session.post(
-            f"{self.base_url}/messages",
-            params={"user_id": user_id},
-            headers=self._headers(),
-            json=body,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return True
-
-    def download_photo(self, attachment: dict) -> bytes | None:
-        """Скачивает фото из MAX по attachment payload."""
-        payload = attachment.get("payload") or {}
-        file_id = payload.get("file_id") or payload.get("id")
-        if not file_id:
-            return None
+    def get_updates(self, timeout: int = 30) -> list:
+        """Long Polling: GET /updates."""
         resp = self.session.get(
-            f"{self.base_url}/files/{file_id}",
+            f"{self.endpoint}/updates",
+            params={"timeout": timeout, "offset": self.last_update_id},
             headers=self._headers(),
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            return resp.content
-        log.warning("Не удалось скачать фото file_id=%s: %s", file_id, resp.status_code)
-        return None
-
-    def answer_callback(self, callback_id: str, text: str, buttons: list | None = None) -> bool:
-        message: dict = {"text": text}
-        if buttons:
-            message["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-        resp = self.session.post(
-            f"{self.base_url}/answers",
-            params={"callback_id": callback_id},
-            headers=self._headers(),
-            json={"message": message},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json().get("success", False)
-
-    def get_updates(self) -> list[dict]:
-        params = {"limit": 100, "timeout": self.poll_timeout}
-        if self.marker is not None:
-            params["marker"] = self.marker
-        resp = self.session.get(
-            f"{self.base_url}/updates",
-            params=params,
-            headers=self._headers(),
-            timeout=self.poll_timeout + 20,
+            timeout=timeout + 10,
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("marker") is not None:
-            self.marker = data["marker"]
-        updates = data.get("updates") or []
-        if updates:
-            log.info("get_updates: %d updates, marker=%s", len(updates), self.marker)
-        return updates
+        if isinstance(data, list):
+            return data
+        return data.get("updates", data.get("result", []))
 
-    # ---------- State Management ----------
+    def send_message(self, user_id, text: str, buttons=None) -> dict:
+        """Отправляет сообщение с опциональной inline-клавиатурой."""
+        payload = {"recipient_id": str(user_id), "text": text}
+        if buttons:
+            payload["inline_keyboard"] = [
+                [{"text": label, "callback_data": data} for label, data in row]
+                for row in buttons
+            ]
+        resp = self.session.post(
+            f"{self.endpoint}/messages",
+            json=payload,
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
-    def _get_state(self, user_id: str) -> State:
-        return self.user_states.get(user_id, {}).get("state", State.MAIN_MENU)
+    def send_photo(self, user_id, photo_data: bytes, caption: str = "",
+                   buttons=None) -> dict:
+        """Загружает файл и отправляет сообщение с фото."""
+        resp = self.session.post(
+            f"{self.endpoint}/files",
+            files={"file": ("photo.jpg", photo_data, "image/jpeg")},
+            headers=self._headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        file_id = data.get("file_id") or data.get("id")
+        if not file_id:
+            raise RuntimeError("MAX API: не получен file_id")
+        payload = {"recipient_id": str(user_id), "file_id": file_id, "caption": caption}
+        if buttons:
+            payload["inline_keyboard"] = [
+                [{"text": label, "callback_data": data} for label, data in row]
+                for row in buttons
+            ]
+        resp = self.session.post(
+            f"{self.endpoint}/messages",
+            json=payload,
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
-    def _set_state(self, user_id: str, state: State, data: dict | None = None) -> None:
-        if user_id not in self.user_states:
-            self.user_states[user_id] = {}
-        self.user_states[user_id]["state"] = state
-        if data:
-            self.user_states[user_id]["data"] = data
-        elif "data" not in self.user_states[user_id]:
-            self.user_states[user_id]["data"] = {}
+    def answer_callback(self, callback_id, text: str = "") -> None:
+        """Подтверждает получение колбэка (ошибки игнорируем)."""
+        try:
+            self.session.post(
+                f"{self.endpoint}/callbacks/answer",
+                json={"callback_id": callback_id, "text": text},
+                headers=self._headers(),
+                timeout=10,
+            )
+        except requests.RequestException:
+            pass
 
-    def _get_data(self, user_id: str) -> dict:
-        return self.user_states.get(user_id, {}).get("data", {})
+    # ------------------------------------------------------------------
+    # Авторизация
+    # ------------------------------------------------------------------
+    def is_admin(self, user_id) -> bool:
+        return str(user_id) in self.admin_ids
 
-    def _update_data(self, user_id: str, **kwargs) -> None:
-        if user_id not in self.user_states:
-            self.user_states[user_id] = {"data": {}}
-        self.user_states[user_id]["data"].update(kwargs)
-
-    def _clear_state(self, user_id: str) -> None:
-        self.user_states.pop(user_id, None)
-
-    # ---------- Main Entry Points ----------
-
+    # ------------------------------------------------------------------
+    # Диспетчеризация апдейтов
+    # ------------------------------------------------------------------
     def handle_update(self, update: dict) -> None:
-        up_type = update.get("update_type")
-        sender = self._sender_id(update)
-        log.info("handle_update: type=%s sender=%s", up_type, sender)
-        if not sender or not self._is_admin(sender):
-            if sender:
-                self.send_message(sender, "Доступ запрещён: вы не оператор студии.")
-            return
-
-        if up_type == "message_created":
-            self._on_message(update)
-        elif up_type == "message_callback":
-            self._on_callback(update)
-        elif up_type in ("bot_started", "bot_added"):
-            self._on_start(update)
-
-    def _sender_id(self, update: dict) -> str | None:
-        user = update.get("user") or {}
-        if user.get("id") is not None:
-            return str(user["id"])
-        message = update.get("message") or {}
-        sender = message.get("sender") or {}
-        if sender.get("user_id") is not None:
-            return str(sender["user_id"])
-        callback = update.get("callback") or {}
-        cb_user = callback.get("user") or {}
-        if cb_user.get("user_id") is not None:
-            return str(cb_user["user_id"])
-        if update.get("chat_id") is not None:
-            return str(update["chat_id"])
-        return None
-
-    def _is_admin(self, user_id: str) -> bool:
-        return bool(self.admin_ids) and user_id in self.admin_ids
-
-    def _on_start(self, update: dict) -> None:
-        user_id = self._sender_id(update)
-        if user_id:
-            self._clear_state(user_id)
-            self._show_contact_request(user_id)
-
-    def _show_contact_request(self, user_id: str) -> None:
-        self._set_state(user_id, State.MAIN_MENU, {})
-        # MAX поддерживает request_contact в кнопках
-        buttons = [
-            [{"type": "callback", "text": "📱 Отправить мой номер", "payload": "request_contact"}],
-            [{"type": "callback", "text": "⏭ Пропустить", "payload": "skip_contact"}],
-        ]
-        self.send_message(user_id,
-            "👋 Добро пожаловать в студию 3D-печати!\n\n"
-            "Для получения уведомлений о заказах нажмите кнопку ниже:",
-            buttons)
-
-    def _show_main_menu(self, user_id: str) -> None:
-        self._set_state(user_id, State.MAIN_MENU)
-        self.send_message(user_id, "🏠 <b>Главное меню</b>\nВыберите действие:", main_menu_keyboard())
-
-    def _handle_contact(self, user_id: str, phone: str) -> None:
-        normalized = self.db._normalize_phone(phone)
-        clients = self.db.get_client_by_phone(normalized)
-
-        if not clients:
-            self.send_message(user_id,
-                "❌ Номер не найден в базе клиентов.\n"
-                "Обратитесь к оператору для регистрации.",
-                back_button("menu:main"))
-            return
-
-        if len(clients) == 1:
-            client = clients[0]
-            self.db.update_client(client["id"], max_id=user_id)
-            self.db.set_channel(client["id"], "max", True)
-            self.send_message(user_id,
-                f"✅ <b>Аккаунт привязан!</b>\n"
-                f"Здравствуйте, {client['full_name']}!\n"
-                f"Теперь вы будете получать уведомления о заказах.",
-                back_button("menu:main"))
-            return
-
-        # Несколько клиентов — показываем выбор
-        buttons = []
-        for c in clients[:10]:
-            buttons.append([{"type": "callback", "text": f"{c['full_name']} ({c['phone']})",
-                             "payload": f"bind_client:{c['id']}"}])
-        buttons.append([{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}])
-        self.send_message(user_id,
-            f"🔍 Найдено {len(clients)} клиентов. Выберите себя:",
-            buttons)
-
-    # ---------- Message Handler (text + photo) ----------
-
-    def _on_message(self, update: dict) -> None:
-        user_id = self._sender_id(update)
+        """Обрабатывает один апдейт от MAX API."""
+        user_id = update.get("user_id") or update.get("sender_id")
         if not user_id:
             return
+        user_id = str(user_id)
+        update_id = update.get("update_id")
+        if update_id:
+            self.last_update_id = max(self.last_update_id, int(update_id))
+        if not self.is_admin(user_id):
+            self.send_message(user_id, "Доступ запрещён")
+            return
+        try:
+            if update.get("callback_data") is not None:
+                self.handle_callback(user_id, update["callback_data"],
+                                     update.get("callback_id"))
+            else:
+                self.handle_message(user_id, update)
+        except Exception as exc:  # noqa: BLE001 — одна ошибка не роняет цикл
+            try:
+                self.send_message(user_id, f"Ошибка: {exc}")
+            except Exception:
+                pass
 
-        state = self._get_state(user_id)
-        message = update.get("message") or {}
-        body = message.get("body") or {}
-        attachments = body.get("attachments") or []
-        text = (body.get("text") or "").strip()
+    def handle_message(self, user_id: str, update: dict) -> None:
+        """Обрабатывает текстовое сообщение или фото в контексте FSM."""
+        text = update.get("text") or ""
+        photo = update.get("photo")
+        state = self.user_states.get(user_id, {}).get("state")
 
-        # Handle photo attachments in any state expecting photo
-        if attachments and state in (State.AWAITING_PHOTO, State.AWAITING_STATUS_PHOTO):
-            for att in attachments:
-                if att.get("type") == "photo":
-                    photo_data = self.download_photo(att)
-                    if photo_data:
-                        self._handle_photo(user_id, photo_data, state)
-                    else:
-                        self.send_message(user_id, "Не удалось загрузить фото. Попробуйте ещё раз.", cancel_button())
-                    return
-
-        # Handle contact attachments (MAX посылает contact в attachment)
-        for att in attachments:
-            if att.get("type") == "contact":
-                contact = att.get("payload") or {}
-                phone = contact.get("phone_number") or contact.get("phone") or ""
-                if phone:
-                    self._handle_contact(user_id, phone)
-                return
-
-        # Handle text input based on state
-        if state == State.ENTERING_DESCRIPTION:
-            self._handle_description(user_id, text)
-        elif state == State.ENTERING_CLIENT_NAME:
-            self._handle_client_name(user_id, text)
-        elif state == State.ENTERING_CLIENT_PHONE:
-            self._handle_client_phone(user_id, text)
-        elif state == State.ENTERING_CLIENT_TG_ID:
-            self._handle_client_tg_id(user_id, text)
-        elif state == State.ENTERING_CLIENT_VK_ID:
-            self._handle_client_vk_id(user_id, text)
-        elif state == State.ENTERING_CLIENT_MAX_ID:
-            self._handle_client_max_id(user_id, text)
-        elif state == State.ENTERING_CLIENT_NOTES:
-            self._handle_client_notes(user_id, text)
-        elif state == State.EDITING_ORDER_DESCRIPTION:
-            self._handle_edit_description(user_id, text)
-        elif state == State.EDITING_ORDER_PRICE:
-            self._handle_edit_price(user_id, text)
-        elif state == State.EDITING_ORDER_DEADLINE:
-            self._handle_edit_deadline(user_id, text)
-        elif state == State.MAIN_MENU:
-            # Ignore random text in main menu, show help
-            self._show_main_menu(user_id)
-
-    def _on_callback(self, update: dict) -> None:
-        callback = update.get("callback") or {}
-        callback_id = callback.get("callback_id")
-        payload = str(callback.get("payload") or "")
-        user_id = self._sender_id(update)
-        if not user_id or not callback_id:
+        if photo:
+            photo_data = self._extract_photo_data(photo)
+            if state == State.AWAITING_PHOTO:
+                self._msg_photo(user_id, photo_data, caption=text)
+            elif state == State.AWAITING_STATUS_PHOTO:
+                self._msg_status_photo(user_id, photo_data, caption=text)
+            else:
+                self.send_message(user_id, "Фото не ожидается. Используйте меню.")
             return
 
-        log.info("callback: user=%s payload=%s state=%s", user_id, payload, self._get_state(user_id))
-
-        parts = payload.split(":")
-        action = parts[0]
-
-        try:
-            if action == "menu":
-                self._handle_menu_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "main")
-            elif action == "client":
-                self._handle_client_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "service":
-                self._handle_service_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "status":
-                self._handle_status_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
-            elif action == "order":
-                self._handle_order_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "neworder":
-                self._handle_new_order_callback(user_id, callback_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
-            elif action == "skip_photo":
-                self._handle_skip_photo(user_id, callback_id)
-            elif action == "confirm":
-                self._handle_confirm(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "client_ch":
-                self._handle_client_channel_toggle(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "client_ch_edit":
-                self._handle_client_channel_edit_toggle(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "edit_field":
-                self._handle_edit_field(user_id, callback_id, parts[1] if len(parts) > 1 else "")
-            elif action == "cancel":
-                self._handle_cancel(user_id, callback_id)
-            elif action == "request_contact":
-                # MAX не поддерживает programmatic request_contact через callback,
-                # но мы можем показать инструкцию
-                self.answer_callback(callback_id,
-                    "📱 Нажмите на кнопку «Поделиться контактом» в клавиатуре ниже и отправьте свой номер:",
-                    [[{"type": "callback", "text": "📱 Поделиться контактом", "payload": "share_contact"}],
-                     [{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]])
-            elif action == "skip_contact":
-                self.answer_callback(callback_id, "Хорошо, можно привязать позже.")
-                self._clear_state(user_id)
-                self._show_main_menu(user_id)
-            elif action == "bind_client" and len(parts) > 1 and parts[1].isdigit():
-                client_id = int(parts[1])
-                self.db.update_client(client_id, max_id=user_id)
-                self.db.set_channel(client_id, "max", True)
-                self.answer_callback(callback_id, "✅ Привязано!", back_button("menu:main"))
-                self._show_main_menu(user_id)
-        except Exception as exc:
-            log.exception("Ошибка обработки callback: %s", exc)
-            self.answer_callback(callback_id, "❌ Произошла ошибка. Попробуйте снова.")
-
-    # ---------- Menu Callbacks ----------
-
-    def _handle_menu_callback(self, user_id: str, callback_id: str, action: str) -> None:
-        if action == "main":
-            self._clear_state(user_id)
-            self._show_main_menu(user_id)
-        elif action == "orders":
-            self._show_orders_list(user_id, callback_id)
-        elif action == "new_order":
-            self._start_new_order(user_id, callback_id)
-        elif action == "clients":
-            self._show_clients_list(user_id, callback_id)
-        elif action == "services":
-            self._show_services_list(user_id, callback_id)
+        if state == State.ENTERING_DESCRIPTION:
+            self._msg_description(user_id, text)
+        elif state in (State.ENTERING_CLIENT_NAME, State.ENTERING_CLIENT_PHONE,
+                       State.ENTERING_CLIENT_TG_ID, State.ENTERING_CLIENT_VK_ID,
+                       State.ENTERING_CLIENT_MAX_ID, State.ENTERING_CLIENT_NOTES):
+            self._msg_client_field(user_id, text)
+        elif state in (State.EDITING_ORDER_DESCRIPTION, State.EDITING_ORDER_PRICE,
+                       State.EDITING_ORDER_DEADLINE):
+            self._msg_order_edit(user_id, text)
+        elif state in (State.ENTERING_SERVICE_NAME, State.ENTERING_SERVICE_PRICE):
+            self._msg_service_field(user_id, text)
         else:
-            self.answer_callback(callback_id, "Неизвестное действие")
+            self._cmd_main_menu(user_id)
 
-    # ---------- Order Creation Flow ----------
+    def handle_callback(self, user_id: str, callback_data: str,
+                        callback_id=None) -> None:
+        """Разбирает callback_data вида action:sub:param1:param2."""
+        if callback_id:
+            self.answer_callback(callback_id)
+        parts = callback_data.split(":")
+        action = parts[0]
+        args = parts[1:]
+        if action == "menu":
+            self._cb_menu(user_id, args)
+        elif action == "client":
+            self._cb_client(user_id, args)
+        elif action == "service":
+            self._cb_service(user_id, args)
+        elif action == "order":
+            self._cb_order(user_id, args)
+        elif action == "status":
+            self._cb_status(user_id, args)
+        elif action == "neworder":
+            self._cb_neworder(user_id, args)
+        elif action == "extra":
+            self._cb_extra(user_id, args)
+        elif action == "confirm":
+            self._cb_confirm(user_id, args)
+        elif action == "edit_field":
+            self._cb_edit_field(user_id, args)
+        elif action == "client_ch":
+            self._cb_client_ch(user_id, args)
+        elif action == "client_ch_edit":
+            self._cb_client_ch_edit(user_id, args)
+        elif action == "skip_photo":
+            self._cb_skip_photo(user_id)
+        elif action == "skip_desc":
+            self._cb_skip_desc(user_id)
+        elif action == "skip_contact":
+            self._cb_skip_contact(user_id)
+        else:
+            self.send_message(user_id, "Неизвестная команда")
 
-    def _start_new_order(self, user_id: str, callback_id: str) -> None:
+    def _extract_photo_data(self, photo: dict) -> bytes | None:
+        """Достаёт байты фото из апдейта (data или url)."""
+        if not photo:
+            return None
+        data = photo.get("data") or photo.get("file_data")
+        if data:
+            return data
+        url = photo.get("url") or photo.get("file_url")
+        if url:
+            resp = self.session.get(url, headers=self._headers(), timeout=30)
+            resp.raise_for_status()
+            return resp.content
+        return None
+
+    # ------------------------------------------------------------------
+    # Меню
+    # ------------------------------------------------------------------
+    def _cmd_main_menu(self, user_id: str) -> None:
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Главное меню", buttons=[
+            [("📋 Заказы", "menu:orders")],
+            [("➕ Новый заказ", "menu:new_order")],
+            [("👥 Клиенты", "menu:clients")],
+            [("🛠 Услуги", "menu:services")],
+        ])
+
+    def _cmd_orders(self, user_id: str) -> None:
+        orders = self.service.list_orders()
+        if not orders:
+            self.send_message(user_id, "Заказов нет",
+                              buttons=[[("← Меню", "menu:main")]])
+            return
+        buttons = [
+            [(f"#{o['id']} {o['client_name']} — {o['status_name']}", f"order:{o['id']}")]
+            for o in orders[:10]
+        ]
+        buttons.append([("← Меню", "menu:main")])
+        self.send_message(user_id, "Заказы:", buttons=buttons)
+
+    def _cmd_new_order(self, user_id: str) -> None:
         clients = self.db.list_clients()
         if not clients:
-            self.answer_callback(callback_id, "Сначала добавьте клиентов через веб-интерфейс.")
+            self.send_message(user_id, "Нет клиентов. Сначала создайте клиента.",
+                              buttons=[[("Создать клиента", "client:create")],
+                                       [("← Меню", "menu:main")]])
             return
+        self.user_states[user_id] = {"state": State.CHOOSING_CLIENT, "data": {}}
+        buttons = [[(c["full_name"], f"client:{c['id']}")] for c in clients]
+        buttons.append([("← Меню", "menu:main")])
+        self.send_message(user_id, "Выберите клиента:", buttons=buttons)
 
-        buttons = []
-        for c in clients[:20]:
-            buttons.append([{"type": "callback", "text": f"{c['full_name']} ({c['phone'] or '—'})", "payload": f"client:{c['id']}"}])
-        buttons.append([{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}])
+    def _cmd_clients(self, user_id: str) -> None:
+        clients = self.db.list_clients()
+        self.user_states[user_id] = {"state": State.CHOOSING_CLIENT_ACTION, "data": {}}
+        if not clients:
+            self.send_message(user_id, "Клиентов нет",
+                              buttons=[[("➕ Создать клиента", "client:create")],
+                                       [("← Меню", "menu:main")]])
+            return
+        buttons = [[(c["full_name"], f"client:view:{c['id']}")] for c in clients]
+        buttons.append([("➕ Создать клиента", "client:create")])
+        buttons.append([("← Меню", "menu:main")])
+        self.send_message(user_id, "Клиенты:", buttons=buttons)
 
-        self._set_state(user_id, State.CHOOSING_CLIENT, {})
-        self.answer_callback(callback_id, "👤 <b>Шаг 1/4: Выберите клиента</b>", buttons)
-
-    def _handle_client_callback(self, user_id: str, callback_id: str, sub_action: str) -> None:
-        if sub_action == "create":
-            self._start_create_client(user_id, callback_id)
-        elif sub_action == "view":
-            # This shouldn't happen directly, view requires client_id
-            self._show_clients_list(user_id, callback_id)
-        elif sub_action == "edit" or sub_action == "delete":
-            # These need client_id, handled by _on_callback with full payload
-            pass
-        else:
-            # Legacy: selecting client for new order
-            if sub_action.isdigit():
-                client_id = int(sub_action)
-                client = self.db.get_client(client_id)
-                if not client:
-                    self.answer_callback(callback_id, "Клиент не найден")
-                    return
-                self._update_data(user_id, client_id=client_id, client_name=client["full_name"])
-                self._show_services_for_order(user_id, callback_id)
-            else:
-                self.answer_callback(callback_id, "Неизвестное действие с клиентом")
-
-    def _show_services_for_order(self, user_id: str, callback_id: str) -> None:
+    def _cmd_services(self, user_id: str) -> None:
         services = self.db.list_services()
         if not services:
-            self.answer_callback(callback_id, "Нет доступных услуг. Добавьте через веб-интерфейс.")
+            self.send_message(user_id, "Услуг нет",
+                              buttons=[[("➕ Создать услугу", "service:create")],
+                                       [("← Меню", "menu:main")]])
             return
+        buttons = [
+            [(f"#{s['id']} {s['name']} — {s['price'] or 0} ₽", f"service:view:{s['id']}")]
+            for s in services
+        ]
+        buttons.append([("➕ Создать услугу", "service:create")])
+        buttons.append([("← Меню", "menu:main")])
+        self.send_message(user_id, "Услуги:", buttons=buttons)
 
-        buttons = []
-        for s in services:
-            price_str = f" — {s['price']} ₽/{s['unit'] or 'шт'}" if s["price"] else ""
-            buttons.append([{"type": "callback", "text": f"{s['name']}{price_str}", "payload": f"service:{s['id']}"}])
-        buttons.append([{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}])
+    # ------------------------------------------------------------------
+    # Колбэки: menu
+    # ------------------------------------------------------------------
+    def _cb_menu(self, user_id: str, args: list) -> None:
+        sub = args[0] if args else "main"
+        if sub == "main":
+            self._cmd_main_menu(user_id)
+        elif sub == "orders":
+            self._cmd_orders(user_id)
+        elif sub == "new_order":
+            self._cmd_new_order(user_id)
+        elif sub == "clients":
+            self._cmd_clients(user_id)
+        elif sub == "services":
+            self._cmd_services(user_id)
 
-        self._set_state(user_id, State.CHOOSING_SERVICE)
-        self.answer_callback(callback_id, "🔧 <b>Шаг 2/4: Выберите основную услугу</b>", buttons)
-
-    def _handle_service_callback(self, user_id: str, callback_id: str, service_id_str: str) -> None:
-        if not service_id_str.isdigit():
-            self.answer_callback(callback_id, "Неверная услуга")
+    # ------------------------------------------------------------------
+    # Колбэки: client
+    # ------------------------------------------------------------------
+    def _cb_client(self, user_id: str, args: list) -> None:
+        if not args:
             return
-        service_id = int(service_id_str)
+        sub = args[0]
+        if sub == "create":
+            self._cb_client_create(user_id)
+        elif sub == "view" and len(args) > 1:
+            self._cb_client_view(user_id, args[1])
+        elif sub == "edit" and len(args) > 1:
+            self._cb_client_edit(user_id, args[1])
+        elif sub == "delete" and len(args) > 1:
+            self._cb_client_delete(user_id, args[1])
+        else:
+            self._cb_client_select(user_id, args[0])
+
+    def _cb_client_select(self, user_id: str, client_id) -> None:
+        if self.user_states.get(user_id, {}).get("state") != State.CHOOSING_CLIENT:
+            return
+        client = self.db.get_client(client_id)
+        if client is None:
+            self.send_message(user_id, "Клиент не найден")
+            return
+        self.user_states[user_id]["data"]["client_id"] = client_id
+        self.user_states[user_id]["state"] = State.CHOOSING_SERVICE
+        services = self.db.list_services()
+        if not services:
+            self.send_message(user_id, "Нет услуг. Сначала создайте услугу.",
+                              buttons=[[("← Меню", "menu:main")]])
+            return
+        buttons = [[(f"{s['name']} — {s['price'] or 0} ₽", f"service:{s['id']}")]
+                   for s in services]
+        buttons.append([("← Меню", "menu:main")])
+        self.send_message(user_id, "Выберите услугу:", buttons=buttons)
+
+    def _cb_client_view(self, user_id: str, client_id) -> None:
+        client = self.db.get_client(client_id)
+        if client is None:
+            self.send_message(user_id, "Клиент не найден")
+            return
+        channels = self.db.get_client_channels(client_id)
+        ch_text = ", ".join(f"{ch}: {'вкл' if on else 'выкл'}"
+                            for ch, on in channels.items()) or "нет"
+        text = (
+            f"Клиент #{client['id']}\n"
+            f"ФИО: {client['full_name']}\n"
+            f"Телефон: {client['phone'] or '—'}\n"
+            f"TG: {client['telegram_id'] or '—'}\n"
+            f"VK: {client['vk_id'] or '—'}\n"
+            f"MAX: {client['max_id'] or '—'}\n"
+            f"Заметки: {client['notes'] or '—'}\n"
+            f"Каналы: {ch_text}"
+        )
+        self.send_message(user_id, text, buttons=[
+            [("✏️ Редактировать", f"client:edit:{client_id}"),
+             ("🗑 Удалить", f"client:delete:{client_id}")],
+            [("← Назад", "menu:clients")],
+        ])
+
+    def _cb_client_create(self, user_id: str) -> None:
+        self.user_states[user_id] = {"state": State.ENTERING_CLIENT_NAME, "data": {}}
+        self.send_message(user_id, "Введите ФИО клиента:",
+                          buttons=[[("← Отмена", "menu:clients")]])
+
+    def _cb_client_edit(self, user_id: str, client_id) -> None:
+        client = self.db.get_client(client_id)
+        if client is None:
+            self.send_message(user_id, "Клиент не найден")
+            return
+        self.user_states[user_id] = {
+            "state": State.CHOOSING_CLIENT_ACTION,
+            "data": {"edit_client_id": client_id},
+        }
+        self.send_message(user_id, "Выберите поле для редактирования:", buttons=[
+            [("ФИО", "edit_field:full_name"), ("Телефон", "edit_field:phone")],
+            [("TG ID", "edit_field:telegram_id"), ("VK ID", "edit_field:vk_id")],
+            [("MAX ID", "edit_field:max_id"), ("Заметки", "edit_field:notes")],
+            [("Каналы", "edit_field:channels")],
+            [("← Назад", f"client:view:{client_id}")],
+        ])
+
+    def _cb_client_delete(self, user_id: str, client_id) -> None:
+        if self.db.has_orders_for_client(client_id):
+            self.send_message(user_id, "Нельзя удалить: у клиента есть заказы",
+                              buttons=[[("← Назад", f"client:view:{client_id}")]])
+            return
+        self.user_states[user_id] = {
+            "state": State.CONFIRMING_CLIENT_DELETE,
+            "data": {"delete_client_id": client_id},
+        }
+        self.send_message(user_id, f"Удалить клиента #{client_id}?", buttons=[
+            [("✅ Удалить", "confirm:delete_client"),
+             ("❌ Отмена", f"client:view:{client_id}")],
+        ])
+
+    # ------------------------------------------------------------------
+    # Колбэки: service
+    # ------------------------------------------------------------------
+    def _cb_service(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        sub = args[0]
+        if sub == "create":
+            self._cb_service_create(user_id)
+        elif sub == "view" and len(args) > 1:
+            self._cb_service_view(user_id, args[1])
+        elif sub == "edit" and len(args) > 1:
+            self._cb_service_edit(user_id, args[1])
+        elif sub == "delete" and len(args) > 1:
+            self._cb_service_delete(user_id, args[1])
+        else:
+            self._cb_service_select(user_id, args[0])
+
+    def _cb_service_select(self, user_id: str, service_id) -> None:
+        if self.user_states.get(user_id, {}).get("state") != State.CHOOSING_SERVICE:
+            return
         service = self.db.get_service(service_id)
-        if not service:
-            self.answer_callback(callback_id, "Услуга не найдена")
+        if service is None:
+            self.send_message(user_id, "Услуга не найдена")
             return
+        self.user_states[user_id]["data"]["service_id"] = service_id
+        self.user_states[user_id]["state"] = State.ENTERING_DESCRIPTION
+        self.send_message(user_id, "Введите описание заказа или нажмите «Пропустить»:",
+                          buttons=[[("Пропустить", "skip_desc")],
+                                   [("← Меню", "menu:main")]])
 
-        self._update_data(user_id, service_id=service_id, service_name=service["name"])
-        self._set_state(user_id, State.ENTERING_DESCRIPTION)
-        self.answer_callback(callback_id,
-            f"📝 <b>Шаг 3/4: Введите описание заказа</b>\n"
-            f"Услуга: {service['name']}\n"
-            f"Напишите текст или нажмите «Пропустить»",
-            [[{"type": "callback", "text": "⏭ Пропустить", "payload": "skip_desc"}],
-             [{"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}]])
-
-    def _handle_description(self, user_id: str, text: str) -> None:
-        data = self._get_data(user_id)
-        if text.lower() in ("пропустить", "skip", "-"):
-            text = ""
-        self._update_data(user_id, description=text)
-        self._set_state(user_id, State.AWAITING_PHOTO)
-        self.send_message(user_id,
-            f"📷 <b>Шаг 4/4: Пришлите фото</b>\n"
-            f"Это может быть фото поломки, желаемой детали или эскиза.\n"
-            f"Можно пропустить.",
-            skip_photo_button() + cancel_button())
-
-    def _handle_skip_photo(self, user_id: str, callback_id: str) -> None:
-        state = self._get_state(user_id)
-        if state == State.AWAITING_STATUS_PHOTO:
-            self._update_data(user_id, status_photo_data=None)
-            self._show_status_change_confirmation(user_id, callback_id)
-        elif state == State.AWAITING_PHOTO:
-            self._update_data(user_id, photo_data=None)
-            self._show_order_confirmation(user_id, callback_id)
-
-    def _handle_photo(self, user_id: str, photo_data: bytes, state: State) -> None:
-        if state == State.AWAITING_STATUS_PHOTO:
-            self._update_data(user_id, status_photo_data=photo_data)
-            self._show_status_change_confirmation(user_id, None)
-        else:  # AWAITING_PHOTO
-            self._update_data(user_id, photo_data=photo_data)
-            self._show_order_confirmation(user_id, None)
-
-    def _show_order_confirmation(self, user_id: str, callback_id: str | None) -> None:
-        data = self._get_data(user_id)
-        text = (
-            f"✅ <b>Подтвердите заказ</b>\n\n"
-            f"Клиент: {data.get('client_name', '—')}\n"
-            f"Услуга: {data.get('service_name', '—')}\n"
-            f"Описание: {data.get('description', '—') or '—'}\n"
-            f"Фото: {'✅ есть' if data.get('photo_data') else '❌ нет'}"
-        )
-        buttons = confirm_keyboard("confirm:create_order", "menu:main")
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _show_status_change_confirmation(self, user_id: str, callback_id: str | None) -> None:
-        data = self._get_data(user_id)
-        order_id = data.get("order_id")
-        status_name = data.get("new_status_name", "—")
-        has_photo = "✅ есть" if data.get("status_photo_data") else "❌ нет"
-
-        text = (
-            f"✅ <b>Подтвердите смену статуса</b>\n\n"
-            f"Заказ: #{order_id}\n"
-            f"Новый статус: {status_name}\n"
-            f"Фото: {has_photo}"
-        )
-        buttons = confirm_keyboard("confirm:change_status", f"order:{order_id}")
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _handle_confirm(self, user_id: str, callback_id: str, action: str) -> None:
-        if action == "create_order":
-            self._create_order(user_id, callback_id)
-        elif action == "change_status":
-            self._execute_status_change(user_id, callback_id)
-        else:
-            self.answer_callback(callback_id, "Неизвестное подтверждение")
-
-    def _create_order(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        required = ["client_id", "service_id"]
-        if not all(k in data for k in required):
-            self.answer_callback(callback_id, "❌ Не хватает данных. Начните заново.")
-            self._clear_state(user_id)
+    def _cb_service_view(self, user_id: str, service_id) -> None:
+        s = self.db.get_service(service_id)
+        if s is None:
+            self.send_message(user_id, "Услуга не найдена")
             return
+        text = (f"Услуга #{s['id']}\nНазвание: {s['name']}\n"
+                f"Ед.: {s['unit'] or '—'}\nЦена: {s['price'] or 0} ₽")
+        self.send_message(user_id, text, buttons=[
+            [("✏️ Редактировать", f"service:edit:{service_id}"),
+             ("🗑 Удалить", f"service:delete:{service_id}")],
+            [("← Назад", "menu:services")],
+        ])
 
-        order_id = self.order_service.create_order(
+    def _cb_service_create(self, user_id: str) -> None:
+        self.user_states[user_id] = {"state": State.ENTERING_SERVICE_NAME, "data": {}}
+        self.send_message(user_id, "Введите название услуги:",
+                          buttons=[[("← Отмена", "menu:services")]])
+
+    def _cb_service_edit(self, user_id: str, service_id) -> None:
+        s = self.db.get_service(service_id)
+        if s is None:
+            self.send_message(user_id, "Услуга не найдена")
+            return
+        self.user_states[user_id] = {
+            "state": State.ENTERING_SERVICE_NAME,
+            "data": {"edit_service_id": service_id},
+        }
+        self.send_message(user_id, f"Введите новое название (текущее: {s['name']}):")
+
+    def _cb_service_delete(self, user_id: str, service_id) -> None:
+        if self.db.has_orders_for_service(service_id):
+            self.send_message(user_id, "Нельзя удалить: услуга используется в заказах",
+                              buttons=[[("← Назад", "menu:services")]])
+            return
+        self.user_states[user_id] = {
+            "state": State.CONFIRMING_SERVICE_DELETE,
+            "data": {"delete_service_id": service_id},
+        }
+        self.send_message(user_id, f"Удалить услугу #{service_id}?", buttons=[
+            [("✅ Удалить", "confirm:delete_service"),
+             ("❌ Отмена", "menu:services")],
+        ])
+
+    # ------------------------------------------------------------------
+    # Колбэки: order
+    # ------------------------------------------------------------------
+    def _cb_order(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        sub = args[0]
+        if sub == "edit" and len(args) > 1:
+            self._cb_order_edit(user_id, args[1])
+        elif sub == "delete" and len(args) > 1:
+            self._cb_order_delete(user_id, args[1])
+        else:
+            self._cb_order_view(user_id, args[0])
+
+    def _cb_order_view(self, user_id: str, order_id) -> None:
+        order = self.service.get_order_detail(order_id)
+        if order is None:
+            self.send_message(user_id, "Заказ не найден")
+            return
+        self.user_states[user_id] = {
+            "state": State.VIEWING_ORDER,
+            "data": {"order_id": order_id},
+        }
+        text = (
+            f"Заказ #{order['id']}\n"
+            f"Клиент: {order['client_name']}\n"
+            f"Услуга: {order['service_name']}\n"
+            f"Статус: {order['status_name']}\n"
+            f"Описание: {order['description'] or '—'}\n"
+            f"Цена: {order['price'] or 0} ₽\n"
+            f"Срок: {order['deadline'] or '—'}"
+        )
+        self.send_message(user_id, text, buttons=[
+            [("🔄 Сменить статус", f"status:change:{order_id}")],
+            [("📷 Фото", f"status:photos:{order_id}"),
+             ("➕ Доп. услуги", f"status:extra:{order_id}")],
+            [("✏️ Редактировать", f"order:edit:{order_id}"),
+             ("🗑 Удалить", f"order:delete:{order_id}")],
+            [("← Меню", "menu:main")],
+        ])
+
+    def _cb_order_edit(self, user_id: str, order_id) -> None:
+        order = self.db.get_order(order_id)
+        if order is None:
+            self.send_message(user_id, "Заказ не найден")
+            return
+        self.user_states[user_id] = {
+            "state": State.CHOOSING_ORDER_EDIT_FIELD,
+            "data": {"edit_order_id": order_id},
+        }
+        self.send_message(user_id, "Выберите поле для редактирования:", buttons=[
+            [("Описание", "edit_field:description"), ("Цена", "edit_field:price")],
+            [("Срок", "edit_field:deadline")],
+            [("← Назад", f"order:{order_id}")],
+        ])
+
+    def _cb_order_delete(self, user_id: str, order_id) -> None:
+        self.user_states[user_id] = {
+            "state": State.CONFIRMING_ORDER_DELETE,
+            "data": {"delete_order_id": order_id},
+        }
+        self.send_message(user_id, f"Удалить заказ #{order_id}?", buttons=[
+            [("✅ Удалить", "confirm:delete_order"),
+             ("❌ Отмена", f"order:{order_id}")],
+        ])
+
+    # ------------------------------------------------------------------
+    # Колбэки: status / neworder / extra
+    # ------------------------------------------------------------------
+    def _cb_status(self, user_id: str, args: list) -> None:
+        if len(args) < 2:
+            return
+        sub, order_id = args[0], args[1]
+        if sub == "change":
+            self._cb_status_change(user_id, order_id)
+        elif sub == "photos":
+            self._cb_status_photos(user_id, order_id)
+        elif sub == "extra":
+            self._cb_status_extra(user_id, order_id)
+
+    def _cb_status_change(self, user_id: str, order_id) -> None:
+        order = self.db.get_order(order_id)
+        if order is None:
+            self.send_message(user_id, "Заказ не найден")
+            return
+        statuses = self.db.list_statuses()
+        buttons = [
+            [(s["name"], f"neworder:status:{order_id}:{s['id']}")]
+            for s in statuses if s["id"] != order["status_id"]
+        ]
+        buttons.append([("← Назад", f"order:{order_id}")])
+        self.user_states[user_id] = {
+            "state": State.CHOOSING_STATUS,
+            "data": {"order_id": order_id},
+        }
+        self.send_message(user_id, "Выберите новый статус:", buttons=buttons)
+
+    def _cb_neworder(self, user_id: str, args: list) -> None:
+        if len(args) < 3:
+            return
+        order_id, status_id = args[1], args[2]
+        status = self.db.get_status(status_id)
+        if status is None:
+            self.send_message(user_id, "Статус не найден")
+            return
+        self.user_states[user_id] = {
+            "state": State.AWAITING_STATUS_PHOTO,
+            "data": {"order_id": order_id, "status_id": status_id,
+                     "status_name": status["name"]},
+        }
+        self.send_message(
+            user_id,
+            f"Новый статус: {status['name']}. Отправьте фото или «Пропустить»:",
+            buttons=[[("Пропустить", "skip_photo")]],
+        )
+
+    def _cb_status_photos(self, user_id: str, order_id) -> None:
+        photos = self.db.get_order_photos(order_id)
+        if not photos:
+            self.send_message(user_id, "Фото нет",
+                              buttons=[[("← Назад", f"order:{order_id}")]])
+            return
+        for p in photos:
+            self.send_photo(user_id, p["photo_data"], caption=p["caption"] or "")
+        self.send_message(user_id, f"Фото заказа #{order_id}: {len(photos)} шт.",
+                          buttons=[[("← Назад", f"order:{order_id}")]])
+
+    def _cb_status_extra(self, user_id: str, order_id) -> None:
+        extras = self.db.get_order_services(order_id)
+        services = self.db.list_services()
+        if extras:
+            text = "Доп. услуги:\n" + "\n".join(
+                f"#{es['service_id']} {es['service_name']} x{es['quantity']} — "
+                f"{es['effective_price'] or 0} ₽" for es in extras
+            )
+        else:
+            text = "Доп. услуг нет"
+        buttons = [[(f"➕ {s['name']}", f"extra:add:{order_id}:{s['id']}")]
+                   for s in services]
+        buttons.append([("← Назад", f"order:{order_id}")])
+        self.send_message(user_id, text, buttons=buttons)
+
+    def _cb_extra(self, user_id: str, args: list) -> None:
+        if len(args) < 3:
+            return
+        order_id, service_id = args[1], args[2]
+        ok = self.service.add_extra_service(order_id, service_id)
+        if ok:
+            self.send_message(user_id, "Доп. услуга добавлена")
+        else:
+            self.send_message(user_id, "Не удалось добавить услугу")
+        self._cb_status_extra(user_id, order_id)
+
+    # ------------------------------------------------------------------
+    # Колбэки: confirm
+    # ------------------------------------------------------------------
+    def _cb_confirm(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        handlers = {
+            "create_order": self._cb_confirm_create_order,
+            "change_status": self._cb_confirm_change_status,
+            "create_client": self._cb_confirm_create_client,
+            "delete_client": self._cb_confirm_delete_client,
+            "delete_order": self._cb_confirm_delete_order,
+            "create_service": self._cb_confirm_create_service,
+            "delete_service": self._cb_confirm_delete_service,
+        }
+        handler = handlers.get(args[0])
+        if handler:
+            handler(user_id)
+
+    def _cb_confirm_create_order(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if not data.get("client_id") or not data.get("service_id"):
+            self.send_message(user_id, "Данные заказа неполные")
+            return
+        order_id = self.service.create_order(
             client_id=data["client_id"],
             service_id=data["service_id"],
             description=data.get("description", ""),
-            status_id=1,  # "принят"
+            price=data.get("price"),
+            deadline=data.get("deadline", ""),
+            status_id=1,
             photo_data=data.get("photo_data"),
-            photo_caption=f"Фото при создании заказа: {data.get('description', '')}",
-            photo_mime="image/jpeg"
+            photo_caption=data.get("photo_caption", ""),
         )
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, f"Заказ #{order_id} создан", buttons=[
+            [("Открыть заказ", f"order:{order_id}")],
+            [("← Меню", "menu:main")],
+        ])
 
-        self._clear_state(user_id)
-        self.answer_callback(callback_id,
-            f"✅ <b>Заказ #{order_id} создан!</b>\n"
-            f"Статус: принят\n"
-            f"Клиент уведомлён.",
-            [[{"type": "callback", "text": "📋 К заказам", "payload": "menu:orders"}]])
-
-    # ---------- Status Change Flow ----------
-
-    def _show_orders_list(self, user_id: str, callback_id: str | None = None) -> None:
-        orders = self.db.list_orders()
-        if not orders:
-            text = "📋 Заказов пока нет."
-            buttons = back_button()
-        else:
-            text = "📋 <b>Список заказов</b> (последние 20):"
-            buttons = []
-            for order in orders[:20]:
-                status_emoji = self._status_emoji(order["status_name"])
-                buttons.append([{"type": "callback",
-                    "text": f"{status_emoji} #{order['id']} {order['client_name']} — {order['service_name']} · {order['status_name']}",
-                    "payload": f"order:{order['id']}"}])
-            buttons.append([{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}])
-
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _handle_order_callback(self, user_id: str, callback_id: str, sub_action: str) -> None:
-        parts = sub_action.split(":")
-        action = parts[0] if parts else ""
-        
-        if action == "edit" and len(parts) > 1:
-            self._start_edit_order(user_id, callback_id, int(parts[1]))
-        elif action == "delete" and len(parts) > 1:
-            self._confirm_delete_order(user_id, callback_id, int(parts[1]))
-        elif action.isdigit():
-            # Legacy: view order by ID
-            order = self.db.get_order(int(action))
-            if not order:
-                self.answer_callback(callback_id, "Заказ не найден")
-                return
-            self._show_order_detail(user_id, callback_id, order)
-        else:
-            self.answer_callback(callback_id, "Неизвестное действие с заказом")
-
-    def _show_order_detail(self, user_id: str, callback_id: str | None, order) -> None:
-        photos = self.db.get_order_photos(order["id"])
-        photo_info = ""
-        if photos:
-            latest = photos[-1]
-            photo_info = f"\n📷 Последнее фото: {latest['status_name']} ({latest['caption'] or 'без описания'})"
-
-        text = (
-            f"📦 <b>Заказ #{order['id']}</b>\n"
-            f"Клиент: {order['client_name']}\n"
-            f"Услуга: {order['service_name']}\n"
-            f"Статус: {self._status_emoji(order['status_name'])} {order['status_name']}\n"
-            f"Описание: {order['description'] or '—'}\n"
-            f"Цена: {order['price'] or '—'} ₽\n"
-            f"Дедлайн: {order['deadline'] or '—'}"
-            f"{photo_info}"
+    def _cb_confirm_change_status(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        order_id, status_id = data.get("order_id"), data.get("status_id")
+        if not order_id or not status_id:
+            self.send_message(user_id, "Данные неполные")
+            return
+        ok = self.service.change_status(
+            order_id, status_id,
+            photo_data=data.get("photo_data"),
+            photo_caption=data.get("photo_caption", ""),
         )
-
-        buttons = [
-            [{"type": "callback", "text": "🔄 Сменить статус", "payload": f"status:change:{order['id']}"}],
-            [{"type": "callback", "text": "📸 История фото", "payload": f"status:photos:{order['id']}"}],
-            [{"type": "callback", "text": "➕ Доп. услуги", "payload": f"status:extra:{order['id']}"}],
-            [{"type": "callback", "text": "✏️ Редактировать", "payload": f"order:edit:{order['id']}"}],
-            [{"type": "callback", "text": "🗑 Удалить", "payload": f"order:delete:{order['id']}"}],
-            [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:orders"}],
-        ]
-
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        if ok:
+            self.send_message(user_id, f"Статус заказа #{order_id} изменён", buttons=[
+                [("Открыть заказ", f"order:{order_id}")],
+                [("← Меню", "menu:main")],
+            ])
         else:
-            self.send_message(user_id, text, buttons)
+            self.send_message(user_id, "Не удалось изменить статус",
+                              buttons=[[("← Меню", "menu:main")]])
 
-    def _handle_status_callback(self, user_id: str, callback_id: str, action: str, value: str) -> None:
-        if action == "change":
-            self._start_status_change(user_id, callback_id, int(value))
-        elif action == "photos":
-            self._show_order_photos(user_id, callback_id, int(value))
-        elif action == "extra":
-            self._show_extra_services(user_id, callback_id, int(value))
-        # "set" action removed - was dead code referencing undefined 'parts'
-
-    def _start_status_change(self, user_id: str, callback_id: str, order_id: int) -> None:
-        order = self.db.get_order(order_id)
-        if not order:
-            self.answer_callback(callback_id, "Заказ не найден")
-            return
-
-        statuses = self.db.list_statuses()
-        buttons = []
-        row = []
-        for st in statuses:
-            if st["id"] == order["status_id"]:
-                continue  # Skip current status
-            row.append({"type": "callback", "text": st["name"], "payload": f"neworder:status:{order_id}:{st['id']}"})
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}])
-
-        self._set_state(user_id, State.CHOOSING_STATUS, {"order_id": order_id})
-        self.answer_callback(callback_id, f"🔄 Выберите новый статус для заказа #{order_id}:", buttons)
-
-    def _handle_new_order_callback(self, user_id: str, callback_id: str, action: str, value: str) -> None:
-        """Handles callbacks with 'neworder:' prefix used in status selection."""
-        if action != "status" or not value.isdigit():
-            return
-        parts = value.split(":")
-        if len(parts) != 2:
-            return
-        order_id = int(parts[0])
-        status_id = int(parts[1])
-        status = self.db.get_status(status_id)
-        if not status:
-            self.answer_callback(callback_id, "Статус не найден")
-            return
-        self._update_data(user_id, new_status_id=status_id, new_status_name=status["name"])
-        self._set_state(user_id, State.AWAITING_STATUS_PHOTO)
-        self.answer_callback(callback_id,
-            f"📷 <b>Пришлите фото для статуса «{status['name']}»</b>\n"
-            f"Например: 3D-скан, чертеж, фото готового изделия.\n"
-            f"Можно пропустить.",
-            skip_photo_button() + [[{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}]])
-
-    def _execute_status_change(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        order_id = data.get("order_id")
-        new_status_id = data.get("new_status_id")
-        new_status_name = data.get("new_status_name")
-        photo_data = data.get("status_photo_data")
-
-        if not order_id or not new_status_id:
-            self.answer_callback(callback_id, "❌ Ошибка: данные потеряны")
-            self._clear_state(user_id)
-            return
-
-        order = self.db.get_order(order_id)
-        if not order:
-            self.answer_callback(callback_id, "Заказ не найден")
-            self._clear_state(user_id)
-            return
-
-        success = self.order_service.change_status(
-            order_id=order_id,
-            new_status_id=new_status_id,
-            photo_data=photo_data,
-            photo_caption=f"Фото при смене на «{new_status_name}»",
-            photo_mime="image/jpeg"
-        )
-
-        if not success:
-            self.answer_callback(callback_id, "❌ Ошибка при смене статуса")
-            self._clear_state(user_id)
-            return
-
-        self._clear_state(user_id)
-        self.answer_callback(callback_id,
-            f"✅ Статус заказа #{order_id} изменён на «{new_status_name}»\n"
-            f"Клиент уведомлён.",
-            [[{"type": "callback", "text": "📦 К заказу", "payload": f"order:{order_id}"}],
-             [{"type": "callback", "text": "📋 К списку", "payload": "menu:orders"}]])
-
-    def _show_order_photos(self, user_id: str, callback_id: str, order_id: int) -> None:
-        photos = self.db.get_order_photos(order_id)
-        if not photos:
-            self.answer_callback(callback_id, "📷 Фото для этого заказа пока нет.", [[{"type": "callback", "text": "⬅️ Назад", "payload": f"order:{order_id}"}]])
-            return
-
-        text = f"📸 <b>История фото заказа #{order_id}</b>:\n\n"
-        for i, p in enumerate(photos, 1):
-            text += f"{i}. <b>{p['status_name']}</b> — {p['caption'] or 'без описания'}\n"
-
-        # Send latest photo
-        latest = photos[-1]
-        self.send_photo(user_id, latest["photo_data"], caption=f"Заказ #{order_id} — {latest['status_name']}\n{latest['caption'] or ''}",
-                        buttons=[[{"type": "callback", "text": "⬅️ Назад", "payload": f"order:{order_id}"}]])
-
-    def _show_extra_services(self, user_id: str, callback_id: str, order_id: int) -> None:
-        order = self.db.get_order(order_id)
-        if not order:
-            self.answer_callback(callback_id, "Заказ не найден")
-            return
-
-        extra = self.db.get_order_services(order_id)
-        services = self.db.list_services()
-
-        text = f"➕ <b>Доп. услуги заказа #{order_id}</b>\n\n"
-        if extra:
-            for e in extra:
-                price = e["price"] if e["price"] is not None else e["default_price"]
-                text += f"• {e['name']} × {e['quantity']} = {price * e['quantity']:.0f} ₽\n"
-        else:
-            text += "Пока нет доп. услуг.\n"
-
-        buttons = []
-        for s in services:
-            buttons.append([{"type": "callback", "text": f"+ {s['name']}", "payload": f"extra:add:{order_id}:{s['id']}"}])
-        buttons.append([{"type": "callback", "text": "⬅️ Назад", "payload": f"order:{order_id}"}])
-
-        self.answer_callback(callback_id, text, buttons)
-
-    # ---------- Clients & Services Lists ----------
-
-    def _show_clients_list(self, user_id: str, callback_id: str | None = None) -> None:
-        clients = self.db.list_clients()
-        if not clients:
-            text = "👥 Клиентов пока нет."
-            buttons = [[{"type": "callback", "text": "➕ Создать клиента", "payload": "client:create"}],
-                       [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}]]
-        else:
-            text = "👥 <b>Клиенты</b> (первые 20):"
-            buttons = [[{"type": "callback", "text": "➕ Создать клиента", "payload": "client:create"}]]
-            for c in clients[:20]:
-                buttons.append([{"type": "callback", "text": f"👁 {c['full_name']} ({c['phone'] or '—'})", "payload": f"client:view:{c['id']}"}])
-                if not self.db.has_orders_for_client(c['id']):
-                    buttons.append([{"type": "callback", "text": "🗑 Удалить", "payload": f"client:delete:{c['id']}"}])
-                else:
-                    buttons.append([{"type": "callback", "text": "✏️ Редактировать", "payload": f"client:edit:{c['id']}"}])
-            buttons.append([{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}])
-
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _show_services_list(self, user_id: str, callback_id: str | None = None) -> None:
-        services = self.db.list_services()
-        if not services:
-            text = "⚙️ Услуг пока нет."
-            buttons = back_button()
-        else:
-            text = "⚙️ <b>Услуги</b>:\nДля редактирования используйте веб-интерфейс."
-            buttons = []
-            for s in services:
-                price_str = f" — {s['price']} ₽/{s['unit'] or 'шт'}" if s["price"] else ""
-                buttons.append([{"type": "callback", "text": f"{s['name']}{price_str}", "payload": f"service:view:{s['id']}"}])
-            buttons.append([{"type": "callback", "text": "⬅️ Назад", "payload": "menu:main"}])
-
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _status_emoji(self, status_name: str) -> str:
-        emoji_map = {
-            "принят": "📥",
-            "в работе": "⚙️",
-            "готов": "✅",
-            "выдан": "📦",
-            "отменён": "❌",
-        }
-        return emoji_map.get(status_name.lower(), "📌")
-
-    def _handle_cancel(self, user_id: str, callback_id: str) -> None:
-        self._clear_state(user_id)
-        self.answer_callback(callback_id, "❌ Отменено", main_menu_keyboard())
-
-    # ---------- Client Management ----------
-
-    def _start_create_client(self, user_id: str, callback_id: str) -> None:
-        self._set_state(user_id, State.ENTERING_CLIENT_NAME, {})
-        self.answer_callback(callback_id, "👤 <b>Создание клиента</b>\nВведите ФИО (обязательно):", cancel_button())
-
-    def _handle_client_name(self, user_id: str, text: str) -> None:
-        text = text.strip()
-        if not text:
-            self.send_message(user_id, "ФИО не может быть пустым. Введите снова:", cancel_button())
-            return
-        self._update_data(user_id, full_name=text)
-        self._set_state(user_id, State.ENTERING_CLIENT_PHONE)
-        self.send_message(user_id, "📞 Телефон (или «пропустить»):", cancel_button())
-
-    def _handle_client_phone(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, phone="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
-        self._set_state(user_id, State.ENTERING_CLIENT_TG_ID)
-        self.send_message(user_id, "🤖 Telegram ID (или «пропустить»):", cancel_button())
-
-    def _handle_client_tg_id(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, telegram_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
-        self._set_state(user_id, State.ENTERING_CLIENT_VK_ID)
-        self.send_message(user_id, "🔵 VK ID (или «пропустить»):", cancel_button())
-
-    def _handle_client_vk_id(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, vk_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
-        self._set_state(user_id, State.ENTERING_CLIENT_MAX_ID)
-        self.send_message(user_id, "🟣 MAX ID (или «пропустить»):", cancel_button())
-
-    def _handle_client_max_id(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, max_id="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
-        self._set_state(user_id, State.ENTERING_CLIENT_NOTES)
-        self.send_message(user_id, "📝 Заметки (или «пропустить»):", cancel_button())
-
-    def _handle_client_notes(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, notes="" if text.lower() in ("пропустить", "skip", "-") else text.strip())
-        self._set_state(user_id, State.CONFIRMING_CLIENT_CREATE)
-        self._show_client_confirmation(user_id, None)
-
-    def _show_client_confirmation(self, user_id: str, callback_id: str | None) -> None:
-        data = self._get_data(user_id)
-        ch_tg = "✅" if data.get("ch_telegram") else "☐"
-        ch_vk = "✅" if data.get("ch_vk") else "☐"
-        ch_max = "✅" if data.get("ch_max") else "☐"
-        text = (
-            f"✅ <b>Подтвердите создание клиента</b>\n\n"
-            f"ФИО: {data.get('full_name', '—')}\n"
-            f"Телефон: {data.get('phone', '—') or '—'}\n"
-            f"Telegram ID: {data.get('telegram_id', '—') or '—'}\n"
-            f"VK ID: {data.get('vk_id', '—') or '—'}\n"
-            f"MAX ID: {data.get('max_id', '—') or '—'}\n"
-            f"Заметки: {data.get('notes', '—') or '—'}\n\n"
-            f"Каналы уведомлений:\n"
-            f"  {ch_tg} Telegram\n"
-            f"  {ch_vk} VK\n"
-            f"  {ch_max} MAX"
-        )
-        buttons = [
-            [{"type": "callback", "text": f"{ch_tg} Telegram", "payload": "client_ch:telegram"},
-             {"type": "callback", "text": f"{ch_vk} VK", "payload": "client_ch:vk"},
-             {"type": "callback", "text": f"{ch_max} MAX", "payload": "client_ch:max"}],
-            [{"type": "callback", "text": "✅ Подтвердить", "payload": "confirm:create_client"},
-             {"type": "callback", "text": "❌ Отмена", "payload": "menu:main"}],
-        ]
-        if callback_id:
-            self.answer_callback(callback_id, text, buttons)
-        else:
-            self.send_message(user_id, text, buttons)
-
-    def _handle_client_channel_toggle(self, user_id: str, callback_id: str, channel: str) -> None:
-        data = self._get_data(user_id)
-        key = f"ch_{channel}"
-        data[key] = not data.get(key, False)
-        self._update_data(user_id, **{key: data[key]})
-        self._show_client_confirmation(user_id, callback_id)
-
-    def _confirm_create_client(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        if "full_name" not in data:
-            self.answer_callback(callback_id, "❌ Не хватает данных")
+    def _cb_confirm_create_client(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if not data.get("full_name"):
+            self.send_message(user_id, "ФИО обязательно")
             return
         client_id = self.db.add_client(
             full_name=data["full_name"],
-            phone=data.get("phone", ""),
-            telegram_id=data.get("telegram_id", ""),
-            vk_id=data.get("vk_id", ""),
-            max_id=data.get("max_id", ""),
-            notes=data.get("notes", ""),
+            phone=data.get("phone") or None,
+            telegram_id=data.get("telegram_id") or None,
+            vk_id=data.get("vk_id") or None,
+            max_id=data.get("max_id") or None,
+            notes=data.get("notes") or None,
         )
-        for ch in ("telegram", "vk", "max"):
-            if data.get(f"ch_{ch}"):
-                self.db.set_channel(client_id, ch, True)
-        self._clear_state(user_id)
-        self.answer_callback(callback_id,
-            f"✅ <b>Клиент #{client_id} создан!</b>\nФИО: {data['full_name']}",
-            [[{"type": "callback", "text": "👥 К клиентам", "payload": "menu:clients"}]])
+        for channel in ("telegram", "vk", "max"):
+            self.db.set_channel(client_id, channel,
+                                data.get(f"channel_{channel}", False))
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, f"Клиент #{client_id} создан",
+                          buttons=[[("← Меню", "menu:main")]])
 
-    def _show_client_detail(self, user_id: str, callback_id: str, client_id: int) -> None:
-        client = self.db.get_client(client_id)
-        if not client:
-            self.answer_callback(callback_id, "Клиент не найден", back_button("menu:clients"))
-            return
-        text = (
-            f"👤 <b>Клиент #{client_id}</b>\n"
-            f"ФИО: {client['full_name']}\n"
-            f"Телефон: {client['phone'] or '—'}\n"
-            f"TG ID: {client['telegram_id'] or '—'}\n"
-            f"VK ID: {client['vk_id'] or '—'}\n"
-            f"MAX ID: {client['max_id'] or '—'}\n"
-            f"Заметки: {client['notes'] or '—'}"
-        )
-        buttons = [
-            [{"type": "callback", "text": "✏️ Редактировать", "payload": f"client:edit:{client_id}"}],
-            [{"type": "callback", "text": "🗑 Удалить", "payload": f"client:delete:{client_id}"}],
-            [{"type": "callback", "text": "⬅️ Назад", "payload": "menu:clients"}],
-        ]
-        self.answer_callback(callback_id, text, buttons)
-
-    def _start_edit_client(self, user_id: str, callback_id: str, client_id: int) -> None:
-        client = self.db.get_client(client_id)
-        if not client:
-            self.answer_callback(callback_id, "Клиент не найден")
-            return
-        self._update_data(user_id, client_id=client_id)
-        self._set_state(user_id, State.CHOOSING_ORDER_EDIT_FIELD)
-        buttons = [
-            [{"type": "callback", "text": "ФИО", "payload": "edit_field:full_name"},
-             {"type": "callback", "text": "Телефон", "payload": "edit_field:phone"},
-             {"type": "callback", "text": "TG ID", "payload": "edit_field:telegram_id"}],
-            [{"type": "callback", "text": "VK ID", "payload": "edit_field:vk_id"},
-             {"type": "callback", "text": "MAX ID", "payload": "edit_field:max_id"},
-             {"type": "callback", "text": "Заметки", "payload": "edit_field:notes"}],
-            [{"type": "callback", "text": "Каналы уведомлений", "payload": "edit_field:channels"},
-             {"type": "callback", "text": "❌ Отмена", "payload": f"client:view:{client_id}"}],
-        ]
-        self.answer_callback(callback_id, "✏️ Что редактировать?", buttons)
-
-    def _show_client_channels_edit(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        client_id = data.get("client_id")
-        client = self.db.get_client(client_id) if client_id else None
-        ch_tg = "✅" if client and client.get("notify_telegram") else "☐"
-        ch_vk = "✅" if client and client.get("notify_vk") else "☐"
-        ch_max = "✅" if client and client.get("notify_max") else "☐"
-        text = "🔔 <b>Каналы уведомлений клиента</b>\nНажмите для переключения:"
-        buttons = [
-            [{"type": "callback", "text": f"{ch_tg} Telegram", "payload": "client_ch_edit:telegram"},
-             {"type": "callback", "text": f"{ch_vk} VK", "payload": "client_ch_edit:vk"},
-             {"type": "callback", "text": f"{ch_max} MAX", "payload": "client_ch_edit:max"}],
-            [{"type": "callback", "text": "⬅️ Назад", "payload": f"client:edit:{client_id}"}],
-        ]
-        self.answer_callback(callback_id, text, buttons)
-
-    def _handle_client_channel_edit_toggle(self, user_id: str, callback_id: str, channel: str) -> None:
-        data = self._get_data(user_id)
-        client_id = data.get("client_id")
+    def _cb_confirm_delete_client(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        client_id = data.get("delete_client_id")
         if not client_id:
-            self.answer_callback(callback_id, "Ошибка: клиент не найден")
             return
-        client = self.db.get_client(client_id)
-        if not client:
-            self.answer_callback(callback_id, "Клиент не найден")
-            return
-        
-        current = client.get(f"notify_{channel}", False)
-        new_value = not current
-        self.db.set_channel(client_id, channel, new_value)
-        
-        # Refresh the view
-        self._show_client_channels_edit(user_id, callback_id)
-
-    def _confirm_delete_client(self, user_id: str, callback_id: str, client_id: int) -> None:
         if self.db.has_orders_for_client(client_id):
-            self.answer_callback(callback_id, "❌ Нельзя удалить: у клиента есть заказы",
-                                 [[{"type": "callback", "text": "⬅️ Назад", "payload": f"client:view:{client_id}"}]])
+            self.send_message(user_id, "Нельзя удалить: у клиента есть заказы")
             return
-        self._update_data(user_id, client_id=client_id)
-        self._set_state(user_id, State.CONFIRMING_CLIENT_DELETE)
-        self.answer_callback(callback_id,
-            f"❗ Удалить клиента #{client_id}?",
-            confirm_keyboard("confirm:delete_client", f"client:view:{client_id}"))
+        self.db.delete_client(client_id)
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Клиент удалён",
+                          buttons=[[("← Меню", "menu:main")]])
 
-    def _execute_delete_client(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        client_id = data.get("client_id")
-        if client_id:
-            self.db.delete_client(client_id)
-        self._clear_state(user_id)
-        self.answer_callback(callback_id, "✅ Клиент удалён",
-                             [[{"type": "callback", "text": "👥 К клиентам", "payload": "menu:clients"}]])
-
-    # ---------- Order Edit & Delete ----------
-
-    def _start_edit_order(self, user_id: str, callback_id: str, order_id: int) -> None:
-        order = self.db.get_order(order_id)
-        if not order:
-            self.answer_callback(callback_id, "Заказ не найден")
+    def _cb_confirm_delete_order(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        order_id = data.get("delete_order_id")
+        if not order_id:
             return
-        self._update_data(user_id, order_id=order_id)
-        self._set_state(user_id, State.CHOOSING_ORDER_EDIT_FIELD)
-        buttons = [
-            [{"type": "callback", "text": "Описание", "payload": "edit_field:description"},
-             {"type": "callback", "text": "Цена", "payload": "edit_field:price"},
-             {"type": "callback", "text": "Дедлайн", "payload": "edit_field:deadline"}],
-            [{"type": "callback", "text": "❌ Отмена", "payload": f"order:{order_id}"}],
-        ]
-        self.answer_callback(callback_id, f"✏️ Что редактировать в заказе #{order_id}?", buttons)
+        self.db.delete_order(order_id)
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Заказ удалён",
+                          buttons=[[("← Меню", "menu:main")]])
 
-    def _handle_edit_description(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, edit_value=text.strip())
-        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
-        self.send_message(user_id,
-            f"Изменить описание на: {text.strip()}?",
-            confirm_keyboard("confirm:edit_order", "menu:orders"))
-
-    def _handle_edit_price(self, user_id: str, text: str) -> None:
-        try:
-            price = float(text.strip()) if text.strip() else None
-        except ValueError:
-            self.send_message(user_id, "Некорректная цена. Введите число:", cancel_button())
+    def _cb_confirm_create_service(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if not data.get("name"):
             return
-        self._update_data(user_id, edit_value=price)
-        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
-        self.send_message(user_id,
-            f"Изменить цену на: {price}?",
-            confirm_keyboard("confirm:edit_order", "menu:orders"))
+        self.db.add_service(name=data["name"], price=data.get("price"))
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Услуга создана",
+                          buttons=[[("← Меню", "menu:main")]])
 
-    def _handle_edit_deadline(self, user_id: str, text: str) -> None:
-        self._update_data(user_id, edit_value=text.strip())
-        self._set_state(user_id, State.CONFIRMING_ORDER_EDIT)
-        self.send_message(user_id,
-            f"Изменить дедлайн на: {text.strip()}?",
-            confirm_keyboard("confirm:edit_order", "menu:orders"))
+    def _cb_confirm_delete_service(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        service_id = data.get("delete_service_id")
+        if not service_id:
+            return
+        if self.db.has_orders_for_service(service_id):
+            self.send_message(user_id, "Нельзя удалить: услуга используется в заказах")
+            return
+        self.db.delete_service(service_id)
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Услуга удалена",
+                          buttons=[[("← Меню", "menu:main")]])
 
-    def _confirm_edit_order(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        order_id = data.get("order_id")
+    # ------------------------------------------------------------------
+    # Колбэки: edit_field / каналы / skip
+    # ------------------------------------------------------------------
+    def _cb_edit_field(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        field = args[0]
+        state = self.user_states.get(user_id, {}).get("state")
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if state == State.CHOOSING_ORDER_EDIT_FIELD:
+            self._cb_order_edit_field(user_id, field)
+        elif data.get("edit_client_id"):
+            self._cb_client_edit_field(user_id, field)
+
+    def _cb_order_edit_field(self, user_id: str, field: str) -> None:
+        field_map = {
+            "description": (State.EDITING_ORDER_DESCRIPTION, "Введите новое описание:"),
+            "price": (State.EDITING_ORDER_PRICE, "Введите новую цену:"),
+            "deadline": (State.EDITING_ORDER_DEADLINE, "Введите новый срок (ГГГГ-ММ-ДД):"),
+        }
+        if field not in field_map:
+            return
+        state, prompt = field_map[field]
+        self.user_states[user_id]["data"]["edit_field"] = field
+        self.user_states[user_id]["state"] = state
+        self.send_message(user_id, prompt)
+
+    def _cb_client_edit_field(self, user_id: str, field: str) -> None:
+        field_map = {
+            "full_name": (State.ENTERING_CLIENT_NAME, "Введите новое ФИО:"),
+            "phone": (State.ENTERING_CLIENT_PHONE, "Введите новый телефон:"),
+            "telegram_id": (State.ENTERING_CLIENT_TG_ID, "Введите новый Telegram ID:"),
+            "vk_id": (State.ENTERING_CLIENT_VK_ID, "Введите новый VK ID:"),
+            "max_id": (State.ENTERING_CLIENT_MAX_ID, "Введите новый MAX ID:"),
+            "notes": (State.ENTERING_CLIENT_NOTES, "Введите новые заметки:"),
+        }
+        if field == "channels":
+            self._show_client_channels_edit(user_id)
+            return
+        if field not in field_map:
+            return
+        state, prompt = field_map[field]
+        self.user_states[user_id]["data"]["edit_field"] = field
+        self.user_states[user_id]["state"] = state
+        self.send_message(user_id, prompt)
+
+    def _cb_client_ch(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        self._toggle_channel(user_id, args[0], edit=False)
+
+    def _cb_client_ch_edit(self, user_id: str, args: list) -> None:
+        if not args:
+            return
+        self._toggle_channel(user_id, args[0], edit=True)
+
+    def _toggle_channel(self, user_id: str, channel: str, edit: bool) -> None:
+        if channel not in ("telegram", "vk", "max"):
+            return
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if edit:
+            client_id = data.get("edit_client_id")
+            if not client_id:
+                return
+            current = self.db.get_client_channels(client_id).get(channel, False)
+            self.db.set_channel(client_id, channel, not current)
+            self._show_client_channels_edit(user_id)
+        else:
+            data[f"channel_{channel}"] = not data.get(f"channel_{channel}", False)
+            self._show_client_summary(user_id)
+
+    def _cb_skip_photo(self, user_id: str) -> None:
+        state = self.user_states.get(user_id, {}).get("state")
+        data = self.user_states.get(user_id, {}).get("data", {})
+        if state == State.AWAITING_PHOTO:
+            data["photo_data"] = None
+            self.user_states[user_id]["state"] = State.CONFIRMING_ORDER
+            self._show_order_summary(user_id)
+        elif state == State.AWAITING_STATUS_PHOTO:
+            data["photo_data"] = None
+            self.user_states[user_id]["state"] = State.CONFIRMING_STATUS_CHANGE
+            self._show_status_summary(user_id)
+
+    def _cb_skip_desc(self, user_id: str) -> None:
+        if self.user_states.get(user_id, {}).get("state") != State.ENTERING_DESCRIPTION:
+            return
+        self.user_states[user_id]["data"]["description"] = ""
+        self.user_states[user_id]["state"] = State.AWAITING_PHOTO
+        self.send_message(user_id, "Отправьте фото или нажмите «Пропустить»:",
+                          buttons=[[("Пропустить", "skip_photo")]])
+
+    def _cb_skip_contact(self, user_id: str) -> None:
+        state = self.user_states.get(user_id, {}).get("state")
+        if state in (State.ENTERING_CLIENT_PHONE, State.ENTERING_CLIENT_TG_ID,
+                     State.ENTERING_CLIENT_VK_ID, State.ENTERING_CLIENT_MAX_ID,
+                     State.ENTERING_CLIENT_NOTES):
+            self._advance_client_creation(user_id)
+        elif state == State.ENTERING_SERVICE_PRICE:
+            self.user_states[user_id]["data"]["price"] = None
+            self.user_states[user_id]["state"] = State.CONFIRMING_SERVICE_CREATE
+            self._show_service_summary(user_id)
+
+    # ------------------------------------------------------------------
+    # Обработка текстовых сообщений по состояниям
+    # ------------------------------------------------------------------
+    def _msg_description(self, user_id: str, text: str) -> None:
+        self.user_states[user_id]["data"]["description"] = text
+        self.user_states[user_id]["state"] = State.AWAITING_PHOTO
+        self.send_message(user_id, "Отправьте фото или нажмите «Пропустить»:",
+                          buttons=[[("Пропустить", "skip_photo")]])
+
+    def _msg_photo(self, user_id: str, photo_data: bytes | None, caption: str = "") -> None:
+        self.user_states[user_id]["data"]["photo_data"] = photo_data
+        self.user_states[user_id]["data"]["photo_caption"] = caption
+        self.user_states[user_id]["state"] = State.CONFIRMING_ORDER
+        self._show_order_summary(user_id)
+
+    def _msg_status_photo(self, user_id: str, photo_data: bytes | None,
+                          caption: str = "") -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        data["photo_data"] = photo_data
+        data["photo_caption"] = caption
+        self.user_states[user_id]["state"] = State.CONFIRMING_STATUS_CHANGE
+        self._show_status_summary(user_id)
+
+    def _msg_client_field(self, user_id: str, text: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        state = self.user_states.get(user_id, {}).get("state")
+        if data.get("edit_client_id"):
+            field = data.get("edit_field")
+            if field == "full_name" and not text.strip():
+                self.send_message(user_id, "ФИО не может быть пустым")
+                return
+            self.db.update_client(data["edit_client_id"], **{field: text.strip()})
+            client_id = data["edit_client_id"]
+            self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+            self.send_message(user_id, "Клиент обновлён",
+                              buttons=[[("← Назад", f"client:view:{client_id}")]])
+            return
+        if state == State.ENTERING_CLIENT_NAME:
+            if not text.strip():
+                self.send_message(user_id, "ФИО не может быть пустым. Введите ФИО:")
+                return
+            data["full_name"] = text.strip()
+        else:
+            field_map = {
+                State.ENTERING_CLIENT_PHONE: "phone",
+                State.ENTERING_CLIENT_TG_ID: "telegram_id",
+                State.ENTERING_CLIENT_VK_ID: "vk_id",
+                State.ENTERING_CLIENT_MAX_ID: "max_id",
+                State.ENTERING_CLIENT_NOTES: "notes",
+            }
+            field = field_map.get(state)
+            if field:
+                data[field] = text.strip()
+        self._advance_client_creation(user_id)
+
+    def _advance_client_creation(self, user_id: str) -> None:
+        next_map = {
+            State.ENTERING_CLIENT_NAME: (State.ENTERING_CLIENT_PHONE,
+                                         "Введите телефон (или «Пропустить»):"),
+            State.ENTERING_CLIENT_PHONE: (State.ENTERING_CLIENT_TG_ID,
+                                          "Введите Telegram ID (или «Пропустить»):"),
+            State.ENTERING_CLIENT_TG_ID: (State.ENTERING_CLIENT_VK_ID,
+                                          "Введите VK ID (или «Пропустить»):"),
+            State.ENTERING_CLIENT_VK_ID: (State.ENTERING_CLIENT_MAX_ID,
+                                          "Введите MAX ID (или «Пропустить»):"),
+            State.ENTERING_CLIENT_MAX_ID: (State.ENTERING_CLIENT_NOTES,
+                                           "Введите заметки (или «Пропустить»):"),
+            State.ENTERING_CLIENT_NOTES: (State.CONFIRMING_CLIENT_CREATE, None),
+        }
+        state = self.user_states.get(user_id, {}).get("state")
+        if state not in next_map:
+            return
+        next_state, prompt = next_map[state]
+        self.user_states[user_id]["state"] = next_state
+        if next_state == State.CONFIRMING_CLIENT_CREATE:
+            self._show_client_summary(user_id)
+        else:
+            self.send_message(user_id, prompt,
+                              buttons=[[("Пропустить", "skip_contact")]])
+
+    def _msg_order_edit(self, user_id: str, text: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        order_id = data.get("edit_order_id")
         field = data.get("edit_field")
-        value = data.get("edit_value")
-        if order_id and field and value is not None:
-            self.db.update_order(order_id, **{field: value})
-        self._clear_state(user_id)
-        self.answer_callback(callback_id, "✅ Заказ обновлён",
-                             [[{"type": "callback", "text": "📦 К заказу", "payload": f"order:{order_id}"}]])
-
-    def _confirm_delete_order(self, user_id: str, callback_id: str, order_id: int) -> None:
-        self._update_data(user_id, order_id=order_id)
-        self._set_state(user_id, State.CONFIRMING_ORDER_DELETE)
-        self.answer_callback(callback_id,
-            f"❗ Удалить заказ #{order_id}?",
-            confirm_keyboard("confirm:delete_order", f"order:{order_id}"))
-
-    def _execute_delete_order(self, user_id: str, callback_id: str) -> None:
-        data = self._get_data(user_id)
-        order_id = data.get("order_id")
-        if order_id:
-            self.db.delete_order(order_id)
-        self._clear_state(user_id)
-        self.answer_callback(callback_id, "✅ Заказ удалён",
-                             [[{"type": "callback", "text": "📋 К заказам", "payload": "menu:orders"}]])
-
-    # ---------- Handle Confirm & Edit Field ----------
-
-    def _handle_confirm(self, user_id: str, callback_id: str, action: str) -> None:
-        if action == "create_order":
-            self._create_order(user_id, callback_id)
-        elif action == "change_status":
-            self._execute_status_change(user_id, callback_id)
-        elif action == "create_client":
-            self._confirm_create_client(user_id, callback_id)
-        elif action == "delete_client":
-            self._execute_delete_client(user_id, callback_id)
-        elif action == "edit_order":
-            self._confirm_edit_order(user_id, callback_id)
-        elif action == "delete_order":
-            self._execute_delete_order(user_id, callback_id)
+        if not order_id or not field:
+            return
+        if field == "price":
+            value = _float(text)
+            if value is None:
+                self.send_message(user_id, "Введите число")
+                return
+            self.db.update_order(order_id, price=value)
+        elif field == "deadline":
+            self.db.update_order(order_id, deadline=text.strip())
         else:
-            self.answer_callback(callback_id, "Неизвестное подтверждение")
+            self.db.update_order(order_id, description=text)
+        self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+        self.send_message(user_id, "Заказ обновлён", buttons=[
+            [("Открыть заказ", f"order:{order_id}")],
+            [("← Меню", "menu:main")],
+        ])
 
-    def _handle_edit_field(self, user_id: str, callback_id: str, field: str) -> None:
-        data = self._get_data(user_id)
-        client_id = data.get("client_id")
-        order_id = data.get("order_id")
+    def _msg_service_field(self, user_id: str, text: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        state = self.user_states.get(user_id, {}).get("state")
+        if data.get("edit_service_id"):
+            if state == State.ENTERING_SERVICE_NAME:
+                name = text.strip()
+                if not name:
+                    self.send_message(user_id, "Название не может быть пустым")
+                    return
+                existing = self.db.get_service_by_name(name)
+                if existing and existing["id"] != data["edit_service_id"]:
+                    self.send_message(user_id, "Услуга уже существует")
+                    return
+                data["name"] = name
+                self.user_states[user_id]["state"] = State.ENTERING_SERVICE_PRICE
+                self.send_message(user_id, "Введите новую цену:")
+            elif state == State.ENTERING_SERVICE_PRICE:
+                price = _float(text)
+                if price is None:
+                    self.send_message(user_id, "Введите число")
+                    return
+                self.db.update_service(data["edit_service_id"],
+                                       name=data["name"], price=price)
+                self.user_states[user_id] = {"state": State.MAIN_MENU, "data": {}}
+                self.send_message(user_id, "Услуга обновлена",
+                                  buttons=[[("← Меню", "menu:services")]])
+            return
+        if state == State.ENTERING_SERVICE_NAME:
+            name = text.strip()
+            if not name:
+                self.send_message(user_id, "Название не может быть пустым")
+                return
+            if self.db.get_service_by_name(name):
+                self.send_message(user_id, "Услуга уже существует")
+                return
+            data["name"] = name
+            self.user_states[user_id]["state"] = State.ENTERING_SERVICE_PRICE
+            self.send_message(user_id, "Введите цену (или «Пропустить»):",
+                              buttons=[[("Пропустить", "skip_contact")]])
+        elif state == State.ENTERING_SERVICE_PRICE:
+            price = _float(text)
+            if price is None:
+                self.send_message(user_id, "Введите число")
+                return
+            data["price"] = price
+            self.user_states[user_id]["state"] = State.CONFIRMING_SERVICE_CREATE
+            self._show_service_summary(user_id)
 
-        if field in ("full_name", "phone", "telegram_id", "vk_id", "max_id", "notes"):
-            self._update_data(user_id, edit_field=field)
-            state_map = {
-                "full_name": State.ENTERING_CLIENT_NAME,
-                "phone": State.ENTERING_CLIENT_PHONE,
-                "telegram_id": State.ENTERING_CLIENT_TG_ID,
-                "vk_id": State.ENTERING_CLIENT_VK_ID,
-                "max_id": State.ENTERING_CLIENT_MAX_ID,
-                "notes": State.ENTERING_CLIENT_NOTES,
-            }
-            self._set_state(user_id, state_map[field])
-            self.answer_callback(callback_id, f"Введите новое значение для {field} (или «пропустить»):", cancel_button())
-        elif field == "channels":
-            self._show_client_channels_edit(user_id, callback_id)
-        elif field in ("description", "price", "deadline"):
-            self._update_data(user_id, edit_field=field)
-            state_map = {
-                "description": State.EDITING_ORDER_DESCRIPTION,
-                "price": State.EDITING_ORDER_PRICE,
-                "deadline": State.EDITING_ORDER_DEADLINE,
-            }
-            self._set_state(user_id, state_map[field])
-            self.answer_callback(callback_id, f"Введите новое значение для {field}:", cancel_button())
-        else:
-            self.answer_callback(callback_id, "Неизвестное поле")
+    # ------------------------------------------------------------------
+    # Сводки для подтверждения
+    # ------------------------------------------------------------------
+    def _show_order_summary(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        client = self.db.get_client(data.get("client_id"))
+        service = self.db.get_service(data.get("service_id"))
+        client_name = client["full_name"] if client else "?"
+        service_name = service["name"] if service else "?"
+        text = (
+            f"Подтвердите заказ:\n"
+            f"Клиент: {client_name}\n"
+            f"Услуга: {service_name}\n"
+            f"Описание: {data.get('description') or '—'}\n"
+            f"Фото: {'есть' if data.get('photo_data') else 'нет'}"
+        )
+        self.send_message(user_id, text, buttons=[
+            [("✅ Подтвердить", "confirm:create_order"),
+             ("❌ Отмена", "menu:main")],
+        ])
 
-    # ---------- Run ----------
+    def _show_status_summary(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        text = (
+            f"Подтвердите смену статуса заказа #{data.get('order_id')}:\n"
+            f"Новый статус: {data.get('status_name')}\n"
+            f"Фото: {'есть' if data.get('photo_data') else 'нет'}"
+        )
+        self.send_message(user_id, text, buttons=[
+            [("✅ Подтвердить", "confirm:change_status"),
+             ("❌ Отмена", f"order:{data.get('order_id')}")],
+        ])
 
-    def run_forever(self) -> None:
-        log.info("MAX-бот запущен (Long Polling)")
+    def _show_client_summary(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        channels = {ch: data.get(f"channel_{ch}", False)
+                    for ch in ("telegram", "vk", "max")}
+        ch_text = ", ".join(f"{ch}: {'вкл' if on else 'выкл'}"
+                            for ch, on in channels.items())
+        text = (
+            f"Подтвердите создание клиента:\n"
+            f"ФИО: {data.get('full_name')}\n"
+            f"Телефон: {data.get('phone') or '—'}\n"
+            f"TG: {data.get('telegram_id') or '—'}\n"
+            f"VK: {data.get('vk_id') or '—'}\n"
+            f"MAX: {data.get('max_id') or '—'}\n"
+            f"Заметки: {data.get('notes') or '—'}\n"
+            f"Каналы: {ch_text}"
+        )
+        buttons = [
+            [(f"{'✅' if on else '⬜'} {ch}", f"client_ch:{ch}")
+             for ch, on in channels.items()],
+            [("✅ Подтвердить", "confirm:create_client"),
+             ("❌ Отмена", "menu:clients")],
+        ]
+        self.send_message(user_id, text, buttons=buttons)
+
+    def _show_client_channels_edit(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        client_id = data.get("edit_client_id")
+        if not client_id:
+            return
+        channels = self.db.get_client_channels(client_id)
+        buttons = [
+            [(f"{'✅' if on else '⬜'} {ch}", f"client_ch_edit:{ch}")
+             for ch, on in channels.items()],
+            [("← Назад", f"client:edit:{client_id}")],
+        ]
+        self.send_message(user_id, "Переключите каналы:", buttons=buttons)
+
+    def _show_service_summary(self, user_id: str) -> None:
+        data = self.user_states.get(user_id, {}).get("data", {})
+        text = (f"Подтвердите создание услуги:\n"
+                f"Название: {data.get('name')}\n"
+                f"Цена: {data.get('price') or '—'} ₽")
+        self.send_message(user_id, text, buttons=[
+            [("✅ Подтвердить", "confirm:create_service"),
+             ("❌ Отмена", "menu:services")],
+        ])
+
+    # ------------------------------------------------------------------
+    # Основной цикл
+    # ------------------------------------------------------------------
+    def run(self, poll_interval: int = 30) -> None:
+        """Бесконечный Long Polling цикл."""
+        print(f"MAX bot started, polling {self.endpoint} every {poll_interval}s")
         while True:
             try:
-                updates = self.get_updates()
+                updates = self.get_updates(timeout=poll_interval)
                 for update in updates:
-                    try:
-                        self.handle_update(update)
-                    except Exception as exc:
-                        log.warning("Ошибка обработки события: %s", exc, exc_info=True)
-            except Exception as exc:
-                log.warning("Ошибка Long Polling: %s", exc)
+                    self.handle_update(update)
+            except KeyboardInterrupt:
+                print("Stopped")
+                break
+            except Exception as exc:  # noqa: BLE001 — цикл не должен умирать
+                print(f"Polling error: {exc}")
                 time.sleep(5)
 
 
 def main() -> None:
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO)
-    instance = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance")
-    os.makedirs(instance, exist_ok=True)
-    db_path = os.environ.get("ORDERS_DB", os.path.join(instance, "orders.db"))
-    init_db(db_path)
-    seed_defaults(db_path)
-    migrate_db(db_path)
-    bot = MaxBot(db_path=db_path)
-    if not bot.token:
-        log.error("MAX_TOKEN не задан — бот не запущен")
+    """Точка входа: инициализация БД и запуск Long Polling."""
+    token = os.environ.get("MAX_TOKEN")
+    endpoint = os.environ.get("MAX_ENDPOINT", "https://platform-api2.max.ru")
+    admin_ids = [x.strip() for x in os.environ.get("MAX_ADMIN_ID", "").split(",")
+                 if x.strip()]
+    if not token or not admin_ids:
+        print("MAX_TOKEN и MAX_ADMIN_ID обязательны (см. .env)")
         return
-    if not bot.admin_ids:
-        log.warning("MAX_ADMIN_ID не задан — команды будут отклоняться")
-    bot.run_forever()
+    db_path = os.environ.get("ORDERS_DB", "instance/orders.db")
+    db = Database(db_path)
+    service = OrderService(db)
+    bot = MaxBot(token=token, endpoint=endpoint, admin_ids=admin_ids,
+                 db=db, service=service)
+    bot.run()
 
 
 if __name__ == "__main__":
