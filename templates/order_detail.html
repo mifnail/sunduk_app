@@ -1,182 +1,98 @@
 {% extends "base.html" %}
-{% block title %}Заказ{% endblock %}
+{% block title %}Заказ #{{ order['id'] }}{% endblock %}
 {% block content %}
-<h2>{{ 'Новый заказ' if not order else 'Заказ #' ~ order.id }}</h2>
+<div class="toolbar">
+  <a class="btn" href="{{ url_for('orders_list') }}">← К списку</a>
+  <a class="btn" href="{{ url_for('orders_edit', order_id=order['id']) }}">Редактировать</a>
+  <form method="post" action="{{ url_for('orders_delete', order_id=order['id']) }}"
+        class="inline" onsubmit="return confirm('Удалить заказ?')">
+    <button type="submit" class="btn btn-danger">Удалить</button>
+  </form>
+</div>
 
-{% if not order %}
-<form method="post" action="{{ url_for('order_create') }}" class="card form" enctype="multipart/form-data">
-{% elif edit_mode %}
-<form method="post" action="{{ url_for('order_update', oid=order.id) }}" class="card form" enctype="multipart/form-data">
-{% else %}
-<form method="post" action="{{ url_for('order_set_status', oid=order.id) }}" class="card form" enctype="multipart/form-data">
-{% endif %}
+<h1>Заказ #{{ order['id'] }}</h1>
 
-  {% if order and not edit_mode %}
-  <div class="order-header">
-    <p><strong>Клиент:</strong> {{ order.client_name }} ({{ order.phone or 'нет телефона' }})</p>
-    <p><strong>Услуга:</strong> {{ order.service_name }}</p>
-    <p><strong>Описание:</strong> {{ order.description or '—' }}</p>
-    <p><strong>Файл модели:</strong> {{ order.model_file or '—' }}</p>
-    <p><strong>Цена:</strong> {{ order.price or '—' }}</p>
-    <p><strong>Срок:</strong> {{ order.deadline or '—' }}</p>
-    <p><strong>Статус:</strong> <span class="badge">{{ order.status_name }}</span></p>
-  </div>
+<table class="table detail">
+  <tr><th>Клиент</th><td>{{ order['client_name'] }}</td></tr>
+  <tr><th>Услуга</th><td>{{ order['service_name'] }}</td></tr>
+  <tr><th>Статус</th><td><span class="badge">{{ order['status_name'] }}</span></td></tr>
+  <tr><th>Описание</th><td>{{ order['description'] or '—' }}</td></tr>
+  <tr><th>Файл модели</th><td>{{ order['model_file'] or '—' }}</td></tr>
+  <tr><th>Цена</th><td>{{ "%.0f"|format(order['price'] or 0) }} ₽</td></tr>
+  <tr><th>Срок</th><td>{{ order['deadline'] or '—' }}</td></tr>
+  <tr><th>Создан</th><td>{{ order['created_at'] }}</td></tr>
+  <tr><th>Обновлён</th><td>{{ order['updated_at'] }}</td></tr>
+  <tr><th>Итого</th><td>{{ "%.0f"|format(order['total'] or 0) }} ₽</td></tr>
+</table>
 
-  <!-- Фото заказа по этапам -->
-  {% if photos %}
-  <div class="photos-section">
-    <h3>📸 Фото по этапам</h3>
-    <div class="photos-grid">
-      {% for p in photos %}
-      <div class="photo-card">
-        <img src="{{ url_for('order_photo', photo_id=p.id) }}" alt="{{ p.status_name }}">
-        <div class="photo-caption">
-          <strong>{{ p.status_name }}</strong><br>
-          {{ p.caption or '—' }}<br>
-          <small>{{ p.created_at }}</small>
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% else %}
-  <p class="empty">Фото пока нет</p>
-  {% endif %}
-
-  <!-- Дополнительные услуги -->
-  <div class="extra-services-section">
-    <h3>➕ Дополнительные услуги</h3>
-    {% if extra_services %}
-    <table class="extra-services-table">
-      <thead><tr><th>Услуга</th><th>Кол-во</th><th>Цена за ед.</th><th>Сумма</th><th></th></tr></thead>
-      <tbody>
-        {% for e in extra_services %}
-        <tr>
-          <td>{{ e.name }}</td>
-          <td>{{ e.quantity }}</td>
-          <td>{{ e.price if e.price is not none else e.default_price }}</td>
-          <td>{{ (e.price if e.price is not none else e.default_price) * e.quantity }}</td>
-          <td>
-            <form method="post" action="{{ url_for('remove_extra_service', oid=order.id, sid=e.service_id) }}" class="inline">
-              <button class="danger small" onclick="return confirm('Удалить доп. услугу?')">Удалить</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <p><strong>Итого доп. услуг:</strong> {{ extra_total }} ₽</p>
-    {% else %}
-    <p class="empty">Нет доп. услуг</p>
-    {% endif %}
-
-    <form method="post" action="{{ url_for('add_extra_service', oid=order.id) }}" class="card form row">
-      <select name="service_id" required>
-        <option value="">Выберите услугу</option>
-        {% for s in services %}
-        <option value="{{ s.id }}">{{ s.name }} {{ '— ' ~ s.price ~ ' ₽/' ~ s.unit if s.price else '' }}</option>
-        {% endfor %}
-      </select>
-      <input type="number" name="quantity" value="1" min="0.01" step="0.01" placeholder="Кол-во">
-      <input type="number" name="price" step="0.01" placeholder="Цена (опц.)">
-      <button>Добавить</button>
-    </form>
-  </div>
-
-  <!-- Смена статуса с фото -->
-  <div class="status-change-section">
-    <h3>🔄 Сменить статус</h3>
-    <div class="row">
-      <select name="status_id" required>
-        {% for s in statuses %}
-        <option value="{{ s.id }}" {% if s.id == order.status_id %}selected{% endif %}>{{ s.name }}</option>
-        {% endfor %}
-      </select>
-      <input type="file" name="status_photo" accept="image/*">
-      <input type="text" name="photo_caption" placeholder="Описание фото (опц.)">
-      <button>Сменить статус</button>
-    </div>
-  </div>
-
-  {% elif edit_mode %}
-  <!-- Редактирование заказа -->
-  <div class="order-header">
-    <p><strong>Клиент:</strong> {{ order.client_name }} ({{ order.phone or 'нет телефона' }})</p>
-    <p><strong>Услуга:</strong> {{ order.service_name }}</p>
-    <p><strong>Статус:</strong> <span class="badge">{{ order.status_name }}</span></p>
-  </div>
-
-  <label>Описание</label>
-  <textarea name="description">{{ order.description or '' }}</textarea>
-
-  <label>Файл модели (STL)</label>
-  <input type="text" name="model_file" value="{{ order.model_file or '' }}">
-
-  <label>Цена</label>
-  <input type="number" step="0.01" name="price" value="{{ order.price or '' }}">
-
-  <label>Срок</label>
-  <input type="date" name="deadline" value="{{ order.deadline or '' }}">
-
-  <button type="submit">Сохранить изменения</button>
-  <a href="{{ url_for('order_detail', oid=order.id) }}" class="button secondary">Отмена</a>
-
-  {% else %}
-  <!-- Создание нового заказа -->
-  <div class="row">
-    <label>Клиент *</label>
-    <select name="client_id" required>
-      {% for c in clients %}<option value="{{ c.id }}">{{ c.full_name }}</option>{% endfor %}
-    </select>
-  </div>
-
-  <div class="row">
-    <label>Услуга *</label>
-    <select name="service_id" required>
-      {% for s in services %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
-    </select>
-  </div>
-
-  <label>Описание</label>
-  <textarea name="description"></textarea>
-
-  <label>Файл модели (STL)</label>
-  <input type="text" name="model_file">
-
-  <label>Цена</label>
-  <input type="number" step="0.01" name="price">
-
-  <label>Срок</label>
-  <input type="date" name="deadline">
-
-  <label>Статус</label>
-  <select name="status_id">
-    {% for s in statuses %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+<h2>Смена статуса</h2>
+<form method="post" action="{{ url_for('orders_status', order_id=order['id']) }}"
+      enctype="multipart/form-data" class="filters">
+  <select name="status_id" required>
+    {% for s in statuses %}
+      {% if s['id'] != order['status_id'] %}
+        <option value="{{ s['id'] }}">{{ s['name'] }}</option>
+      {% endif %}
+    {% endfor %}
   </select>
-
-  <label>Фото (опционально)</label>
-  <input type="file" name="photo" accept="image/*">
-  <input type="text" name="photo_caption" placeholder="Описание фото">
-
-  <button>Создать заказ</button>
-  {% endif %}
+  <input type="file" name="status_photo" accept="image/*">
+  <input type="text" name="photo_caption" placeholder="Подпись к фото">
+  <button type="submit" class="btn btn-primary">Сменить статус</button>
 </form>
 
-{% if order and not edit_mode %}
-<h3>История статусов</h3>
-<table>
-  <thead><tr><th>Дата</th><th>Статус</th></tr></thead>
+<h2>История статусов</h2>
+<ul class="timeline">
+  {% for h in order['history'] %}
+  <li>{{ h['changed_at'] }} — {{ h['status_name'] }}</li>
+  {% else %}
+  <li>История пуста</li>
+  {% endfor %}
+</ul>
+
+<h2>Фото</h2>
+<div class="gallery">
+  {% for p in order['photos'] %}
+  <figure>
+    <img src="{{ url_for('order_photo', photo_id=p['id']) }}" alt="{{ p['caption'] or 'фото' }}">
+    <figcaption>{{ p['caption'] or '' }}</figcaption>
+  </figure>
+  {% else %}
+  <p>Фото нет</p>
+  {% endfor %}
+</div>
+
+<h2>Доп. услуги</h2>
+<table class="table">
+  <thead>
+    <tr><th>Услуга</th><th>Кол-во</th><th>Цена</th><th></th></tr>
+  </thead>
   <tbody>
-    {% for h in history %}
-    <tr><td>{{ h.changed_at }}</td><td>{{ h.status_name }}</td></tr>
+    {% for es in order['extra_services'] %}
+    <tr>
+      <td>{{ es['service_name'] }}</td>
+      <td>{{ es['quantity'] }}</td>
+      <td>{{ "%.0f"|format(es['effective_price'] or 0) }} ₽</td>
+      <td>
+        <form method="post"
+              action="{{ url_for('orders_extra_remove', order_id=order['id'], service_id=es['service_id']) }}"
+              class="inline">
+          <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="empty">Доп. услуг нет</td></tr>
     {% endfor %}
   </tbody>
 </table>
-
-<form method="post" action="{{ url_for('order_delete', oid=order.id) }}" class="inline">
-  <button class="danger" onclick="return confirm('Удалить заказ?')">Удалить заказ</button>
+<form method="post" action="{{ url_for('orders_extra_add', order_id=order['id']) }}" class="filters">
+  <select name="service_id" required>
+    {% for s in services %}
+      <option value="{{ s['id'] }}">{{ s['name'] }} — {{ "%.0f"|format(s['price'] or 0) }} ₽</option>
+    {% endfor %}
+  </select>
+  <input type="number" name="quantity" value="1" step="any" min="0">
+  <input type="number" name="price" step="any" placeholder="Цена (необязательно)">
+  <button type="submit" class="btn btn-primary">Добавить</button>
 </form>
-
-<a href="{{ url_for('order_edit', oid=order.id) }}" class="button">✏️ Редактировать заказ</a>
-{% endif %}
 {% endblock %}
